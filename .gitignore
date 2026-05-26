@@ -1,0 +1,28 @@
+# .gitignore for NQ Alpha Levels Bot
+# Keep credentials, logs, and generated files out of GitHub
+
+# Credentials — NEVER commit these
+.env
+*.env
+
+# Generated files that rebuild automatically
+bot_state.json
+backtest_trades.csv
+study_results.csv
+levels_xgb_model_backup.joblib
+
+# Logs
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
