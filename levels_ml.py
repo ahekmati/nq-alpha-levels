@@ -2247,6 +2247,66 @@ def ensemble(symbol="@MNQ", tf_label="H1", n_bars=3000,
         print(f"\n  No levels with {min_models}+ model consensus found.")
         print(f"  Current market may not have clear buy zones.")
 
+    # ── Per-model top pick — each model nominates its best level ─────────────
+    print(f"\n{SEP}")
+    print("EACH MODEL'S TOP PICK  (independent nominations)")
+    print(SEP)
+    print(f"  {'Model':<20} {'Top Level':>12} {'Score':>8} "
+          f"{'Dist':>7} {'Touches':>8} {'Age':>6}")
+    print("  " + "-" * 65)
+
+    model_picks = {}
+    for name in model_names:
+        if not level_results:
+            continue
+        # Find level with highest score from this model
+        best = max(level_results, key=lambda r: r["scores"][name])
+        model_picks[name] = best
+        sl   = best["level"] - SL_ATR * atr_val
+        risk = abs(best["level"] - sl)
+        tp   = best["level"] + TP_R * risk
+        print(f"  {name:<20} {best['level']:>12,.2f} "
+              f"{best['scores'][name]:>8.1%} "
+              f"{best['dist_atr']:>6.1f}x "
+              f"{best['touch_count']:>8} "
+              f"{best['age_bars']:>6}")
+
+    # Find overlap — levels nominated by multiple models
+    if model_picks:
+        from collections import Counter
+        nominated_levels = [r["level"] for r in model_picks.values()]
+        level_counts = Counter(nominated_levels)
+
+        overlaps = {lvl: cnt for lvl, cnt in level_counts.items() if cnt >= 2}
+
+        if overlaps:
+            print(f"\n  🎯 OVERLAP — multiple models independently chose same level:")
+            for lvl, cnt in sorted(overlaps.items(),
+                                   key=lambda x: x[1], reverse=True):
+                agreeing_models = [name for name, r in model_picks.items()
+                                   if r["level"] == lvl]
+                # Find full result for this level
+                lvl_result = next((r for r in level_results
+                                   if r["level"] == lvl), None)
+                if lvl_result:
+                    sl   = lvl - SL_ATR * atr_val
+                    risk = abs(lvl - sl)
+                    tp   = lvl + TP_R * risk
+                    print(f"\n  {'🔥' if cnt == len(model_names) else '✅'} "
+                          f"{lvl:,.2f} — chosen by {cnt}/{len(model_names)} models")
+                    print(f"  Models   : {', '.join(agreeing_models)}")
+                    print(f"  Scores   : " + "  ".join(
+                        f"{n[:3]}:{lvl_result['scores'][n]:.0%}"
+                        for n in agreeing_models))
+                    print(f"  Entry: {lvl:,.2f}  "
+                          f"SL: {sl:,.2f}  "
+                          f"TP: {tp:,.2f}")
+                    print(f"  Risk: {risk:.0f}pts (${risk*2:.0f})  "
+                          f"Target: {risk*TP_R:.0f}pts (${risk*TP_R*2:.0f})")
+        else:
+            print(f"\n  No overlap — models disagree on best level.")
+            print(f"  Unclear market structure — consider waiting.")
+
     print(f"\n{SEP}")
     print(f"Threshold: {min_consensus_score:.0%} per model | "
           f"Min consensus: {min_models}/{len(model_names)} models")
