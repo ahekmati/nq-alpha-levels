@@ -41,6 +41,8 @@ DATASET_PATH  = "levels_dataset.csv"
 MODEL_PATH    = "levels_xgb_model.joblib"
 SCORE_THRESH  = 0.60
 R_TARGET      = 1.5
+SL_ATR        = 1.0      # stop loss multiplier (used in ensemble scan)
+TP_R          = 2.0      # take profit multiplier (used in ensemble scan)
 ATR_PERIOD    = 14
 
 # Level detection params
@@ -1789,9 +1791,475 @@ def retrain(symbol="@MNQ", tf_label="H1", n_bars=50000,
 
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 14. Ensemble — train 4 models, score all levels, show consensus buy zones
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ensemble(symbol="@MNQ", tf_label="H1", n_bars=3000,
+             min_consensus_score=0.60, min_models=2,
+             dataset_path=DATASET_PATH):
+    """
+    Trains 4 models (XGBoost, Random Forest, LightGBM, HistGradientBoosting)
+    using walk-forward OOS, then scores all active levels with each model.
+
+    Output shows:
+      - Each level scored by all 4 models
+      - Consensus count (how many models agree it's high probability)
+      - Recommended buy zones ranked by consensus strength
+      - Entry, SL, TP pre-calculated for each zone
+
+    Also saves ensemble_models.joblib for use by the alert script.
+    """
+    from xgboost import XGBClassifier
+    from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
+    from sklearn.model_selection import cross_val_score
+
+    # Optional LightGBM — graceful fallback if not installed
+    try:
+        from lightgbm import LGBMClassifier
+        HAS_LGBM = True
+    except ImportError:
+        HAS_LGBM = False
+        print("[ENSEMBLE] LightGBM not installed — using 3 models")
+        print("[ENSEMBLE] Install with: pip install lightgbm")
+
+    # ── Load dataset ──────────────────────────────────────────────────────────
+    df = pd.read_csv(dataset_path, parse_dates=["timestamp"])
+    df.dropna(subset=["outcome"], inplace=True)
+    df["outcome"] = df["outcome"].astype(int)
+    df.sort_values("timestamp", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    feature_cols = [c for c in df.columns if c not in ("timestamp", "outcome")]
+    X = df[feature_cols].values
+    y = df["outcome"].values
+    n = len(df)
+
+    print(f"\n{'='*65}")
+    print("ENSEMBLE MODEL TRAINING")
+    print(f"{'='*65}")
+    print(f"Dataset: {n} samples | {y.sum()} wins | {(y==0).sum()} losses")
+    print(f"Date range: {df['timestamp'].iloc[0].date()} → "
+          f"{df['timestamp'].iloc[-1].date()}\n")
+
+    # ── Define models ─────────────────────────────────────────────────────────
+    model_configs = {
+        "XGBoost": XGBClassifier(
+            n_estimators=400, max_depth=4, learning_rate=0.04,
+            subsample=0.8, colsample_bytree=0.75, min_child_weight=5,
+            scale_pos_weight=(y==0).sum() / max(y.sum(), 1),
+            eval_metric="logloss", random_state=42, verbosity=0,
+        ),
+        "RandomForest": RandomForestClassifier(
+            n_estimators=400, max_depth=6, min_samples_leaf=5,
+            class_weight="balanced", random_state=42, n_jobs=-1,
+        ),
+        "HistGradBoost": HistGradientBoostingClassifier(
+            max_iter=400, max_depth=4, min_samples_leaf=5,
+            learning_rate=0.04, random_state=42,
+        ),
+    }
+    if HAS_LGBM:
+        model_configs["LightGBM"] = LGBMClassifier(
+            n_estimators=400, max_depth=4, learning_rate=0.04,
+            subsample=0.8, colsample_bytree=0.75, min_child_per_leaf=5,
+            scale_pos_weight=(y==0).sum() / max(y.sum(), 1),
+            random_state=42, verbose=-1,
+        )
+
+    model_names = list(model_configs.keys())
+
+    # ── Walk-forward OOS scoring for each model ───────────────────────────────
+    print("Walk-forward OOS validation (5 folds):")
+    print(f"  {'Model':<20} {'F1':>8} {'F2':>8} {'F3':>8} {'F4':>8} "
+          f"{'Mean AUC':>10} {'Std':>8}")
+    print("  " + "-" * 72)
+
+    n_splits  = 5
+    fold_size = n // n_splits
+    trained_models = {}
+    oos_scores     = {}
+    model_aucs     = {}
+
+    from sklearn.metrics import roc_auc_score
+
+    for name, clf_template in model_configs.items():
+        oos_probs  = np.full(n, np.nan)
+        fold_aucs  = []
+        fold_models = []
+
+        for fold in range(1, n_splits):
+            train_end  = fold * fold_size
+            test_start = train_end
+            test_end   = min(test_start + fold_size, n)
+            if test_end <= test_start:
+                break
+
+            X_tr, y_tr = X[:train_end], y[:train_end]
+            X_te, y_te = X[test_start:test_end], y[test_start:test_end]
+
+            if len(np.unique(y_tr)) < 2:
+                fold_models.append(None)
+                continue
+
+            # Clone the model for this fold
+            import copy
+            clf = copy.deepcopy(clf_template)
+            clf.fit(X_tr, y_tr)
+            fold_models.append(clf)
+
+            probs = clf.predict_proba(X_te)[:, 1]
+            oos_probs[test_start:test_end] = probs
+
+            try:
+                fold_aucs.append(roc_auc_score(y_te, probs))
+            except Exception:
+                pass
+
+        # Train final model on full dataset
+        final_clf = copy.deepcopy(clf_template)
+        final_clf.fit(X, y)
+        trained_models[name] = {
+            "model":       final_clf,
+            "fold_models": fold_models,
+            "features":    feature_cols,
+        }
+
+        mean_auc = float(np.mean(fold_aucs)) if fold_aucs else 0.0
+        std_auc  = float(np.std(fold_aucs))  if fold_aucs else 0.0
+        model_aucs[name]   = mean_auc
+        oos_scores[name]   = oos_probs
+
+        fold_str = "".join(f"{a:>8.4f}" for a in fold_aucs)
+        print(f"  {name:<20}{fold_str}  {mean_auc:>10.4f}  {std_auc:>8.4f}")
+
+    # ── OOS consensus analysis ────────────────────────────────────────────────
+    oos_mask = ~np.isnan(list(oos_scores.values())[0])
+    df_oos   = df[oos_mask].copy()
+
+    for name in model_names:
+        df_oos[f"score_{name}"] = oos_scores[name][oos_mask]
+
+    score_cols = [f"score_{n}" for n in model_names]
+    df_oos["avg_score"]  = df_oos[score_cols].mean(axis=1)
+    df_oos["n_agree"]    = (df_oos[score_cols] >= min_consensus_score).sum(axis=1)
+
+    print(f"\n{'='*65}")
+    print("OOS CONSENSUS PERFORMANCE")
+    print(f"{'='*65}")
+    print(f"  {'Consensus':>12} {'Trades':>8} {'WinRate':>9} "
+          f"{'ProfitFactor':>14} {'ExpectancyR':>13}")
+    print("  " + "-" * 60)
+
+    for n_models in range(len(model_names), 0, -1):
+        subset = df_oos[df_oos["n_agree"] >= n_models]
+        if len(subset) < 5:
+            continue
+        w   = (subset["outcome"] == 1).sum()
+        l   = (subset["outcome"] == 0).sum()
+        tot = len(subset)
+        wr  = w / tot
+        gp  = w * R_TARGET
+        gl  = float(l)
+        pf  = gp / gl if gl > 0 else float("inf")
+        exp = (gp - gl) / tot
+        marker = " ◀ recommended" if n_models == len(model_names) else ""
+        print(f"  {n_models}/{len(model_names)} agree  {tot:>8} "
+              f"{wr:>9.1%} {pf:>14.3f} {exp:>+13.4f}R{marker}")
+
+    # ── Save ensemble models ──────────────────────────────────────────────────
+    ensemble_path = "ensemble_models.joblib"
+    joblib.dump({
+        "models":       trained_models,
+        "model_names":  model_names,
+        "features":     feature_cols,
+        "model_aucs":   model_aucs,
+        "min_score":    min_consensus_score,
+    }, ensemble_path)
+    print(f"\n[ENSEMBLE] Models saved → {ensemble_path}")
+
+    # ── Now scan live levels with all 4 models ────────────────────────────────
+    tf  = TF_LABEL_MAP[tf_label]
+    htf = HTF_MAP.get(tf, TIMEFRAME_H4)
+
+    connect()
+    print(f"\n[ENSEMBLE] Pulling {n_bars} bars for live scan ...")
+    bars     = get_bars(symbol, tf,  n=n_bars)
+    htf_bars = get_bars(symbol, htf, n=n_bars // 4)
+    mt5.shutdown()
+
+    atr_s         = calc_atr(bars, ATR_PERIOD)
+    atr_val       = atr_s.iloc[-1]
+    current_price = bars["close"].iloc[-1]
+
+    # Daily trend
+    daily_ema100  = calc_ema(bars["close"], 100)  # proxy on H1
+    trend_bullish = current_price > daily_ema100.iloc[-1]
+
+    print(f"\n{'='*65}")
+    print(f"LIVE ENSEMBLE SCAN — {symbol} {tf_label}")
+    print(f"{'='*65}")
+    print(f"Price: {current_price:,.2f} | ATR: {atr_val:.1f} pts")
+    print(f"Trend: {'BULLISH ✅' if trend_bullish else 'BEARISH ❌'}\n")
+
+    # Find active levels
+    all_swings  = find_swing_lows(bars)
+    closes_arr  = bars["close"].values
+    candidates  = []
+
+    for _, sw in all_swings.iterrows():
+        level    = sw["price"]
+        origin_i = int(sw["bar_index"])
+        zone_lo  = level - LEVEL_ZONE_ATR * sw["atr_at_formation"]
+
+        if level > current_price + atr_val:
+            continue
+        dist_atr = (current_price - level) / atr_val
+        if dist_atr > 10.0 or dist_atr < 0:
+            continue
+
+        subsequent = closes_arr[origin_i + 1:]
+        if len(subsequent) > 0 and np.any(subsequent < zone_lo):
+            continue
+
+        touch_count = 0
+        in_z = False
+        zone_w = LEVEL_ZONE_ATR * sw["atr_at_formation"]
+        for k in range(origin_i + 1, len(bars)):
+            in_zone_k = abs(bars["low"].iloc[k] - level) <= zone_w * 2
+            if in_zone_k and not in_z:
+                touch_count += 1
+            in_z = in_zone_k
+
+        candidates.append({
+            "price":            level,
+            "origin_i":         origin_i,
+            "atr_at_formation": sw["atr_at_formation"],
+            "dist_atr":         dist_atr,
+            "touch_count":      touch_count,
+            "age_bars":         len(bars) - 1 - origin_i,
+        })
+
+    if not candidates:
+        print("No active levels found in range.")
+        return
+
+    print(f"Found {len(candidates)} active levels — scoring with all models...\n")
+
+    # Score each level with all models
+    level_results = []
+
+    for lv in sorted(candidates, key=lambda x: x["dist_atr"]):
+        # Build feature row
+        i       = len(bars) - 1
+        ts      = bars.index[i]
+        close   = bars["close"].iloc[i]
+        level   = lv["price"]
+        origin_i = lv["origin_i"]
+
+        body       = abs(bars["close"].iloc[i] - bars["open"].iloc[i])
+        bar_low    = bars["low"].iloc[i]
+        bar_high   = bars["high"].iloc[i]
+        lower_wick = min(bars["open"].iloc[i], close) - bar_low
+        upper_wick = bar_high - max(bars["open"].iloc[i], close)
+        c_range    = bar_high - bar_low
+
+        consec_red = 0
+        for k in range(i-1, max(0, i-8), -1):
+            if bars["close"].iloc[k] < bars["open"].iloc[k]:
+                consec_red += 1
+            else:
+                break
+
+        vol_ma    = bars["volume"].rolling(20).mean().iloc[i]
+        vol_ratio = bars["volume"].iloc[i] / vol_ma if vol_ma > 0 else 1.0
+
+        ref_highs = bars["high"].iloc[origin_i+1:i]
+        max_h     = ref_highs.max() if len(ref_highs) > 0 else level
+        dep_h     = (max_h - level) / atr_val if atr_val > 0 else 0
+
+        htf_ema20  = calc_ema(htf_bars["close"], 20)
+        htf_ema50  = calc_ema(htf_bars["close"], 50)
+        htf_atr_s  = calc_atr(htf_bars)
+        htf_prior  = htf_bars[htf_bars.index <= ts]
+        if len(htf_prior) < 5:
+            continue
+        htf_c    = htf_prior["close"].iloc[-1]
+        htf_e20  = htf_ema20.reindex(htf_prior.index).iloc[-1]
+        htf_e50  = htf_ema50.reindex(htf_prior.index).iloc[-1]
+        htf_a    = htf_atr_s.reindex(htf_prior.index).iloc[-1]
+        htf_trend = 1 if htf_c > htf_e20 else -1
+        htf_pct   = (htf_c - htf_e20) / htf_e20 if htf_e20 > 0 else 0
+        htf_e20d  = abs(level - htf_e20) / htf_a if htf_a > 0 else 99
+        htf_e50d  = abs(level - htf_e50) / htf_a if htf_a > 0 else 99
+        htf_conf  = int(min(htf_e20d, htf_e50d) < 0.5)
+
+        ema20  = calc_ema(bars["close"], 20).iloc[i]
+        ema50  = calc_ema(bars["close"], 50).iloc[i]
+        ema200 = calc_ema(bars["close"], 200).iloc[i]
+        rsi    = calc_rsi(bars["close"]).iloc[i]
+        atp    = calc_atr_percentile(atr_s).iloc[i]
+        if np.isnan(atp): atp = 0.5
+
+        hour    = ts.hour
+        session = 0
+        if 7  <= hour < 13: session = 1
+        if 13 <= hour < 21: session = 2
+
+        round_100  = round(level / 100) * 100
+        dist_round = abs(level - round_100) / atr_val
+        risk_proxy = abs(close - (level - SL_ATR * atr_val))
+
+        feat = {
+            "touch_count":         lv["touch_count"],
+            "level_age_bars":      min(lv["age_bars"], 500),
+            "departure_height":    dep_h,
+            "origin_departure":    dep_h,
+            "approach_drop_atr":   abs(bars["close"].iloc[max(0,i-5)] - close) / atr_val,
+            "approach_consec_red": consec_red,
+            "approach_vol_ratio":  vol_ratio,
+            "close_above_level":   int(close > level),
+            "wick_touched_level":  int(bar_low <= level + LEVEL_ZONE_ATR * atr_val),
+            "wick_body_ratio":     lower_wick / body if body > 0 else 0,
+            "close_pos_range":     (close - bar_low) / c_range if c_range > 0 else 0,
+            "precision":           abs(bar_low - level) / atr_val,
+            "body_atr":            body / atr_val,
+            "rsi":                 rsi,
+            "pct_from_ema20":      (close - ema20) / ema20,
+            "pct_from_ema50":      (close - ema50) / ema50,
+            "pct_from_ema200":     (close - ema200) / ema200,
+            "atr_percentile":      atp,
+            "htf_trend":           htf_trend,
+            "htf_pct_ema20":       htf_pct,
+            "htf_confluence":      htf_conf,
+            "session":             session,
+            "hour":                hour,
+            "day_of_week":         ts.dayofweek,
+            "dist_round_number":   dist_round,
+            "risk_atr":            risk_proxy / atr_val if atr_val > 0 else 0,
+        }
+
+        X_row  = np.array([[feat.get(c, 0) for c in feature_cols]])
+        scores = {}
+        for name, m_info in trained_models.items():
+            try:
+                scores[name] = float(
+                    m_info["model"].predict_proba(X_row)[0, 1])
+            except Exception:
+                scores[name] = 0.0
+
+        avg_score  = float(np.mean(list(scores.values())))
+        n_agreeing = sum(1 for s in scores.values()
+                         if s >= min_consensus_score)
+
+        level_results.append({
+            "level":       level,
+            "dist_atr":    lv["dist_atr"],
+            "touch_count": lv["touch_count"],
+            "age_bars":    lv["age_bars"],
+            "scores":      scores,
+            "avg_score":   avg_score,
+            "n_agree":     n_agreeing,
+            "n_models":    len(model_names),
+        })
+
+    # Sort by consensus then avg score
+    level_results.sort(key=lambda x: (x["n_agree"], x["avg_score"]),
+                       reverse=True)
+
+    # ── Print consensus table ─────────────────────────────────────────────────
+    SEP = "=" * 72
+
+    print(SEP)
+    print(f"{'LEVEL':>12} {'DIST':>7} {'TCH':>4} {'AGE':>5}", end="")
+    for name in model_names:
+        print(f"  {name[:6]:>6}", end="")
+    print(f"  {'AVG':>6}  {'AGREE':>7}  {'SIGNAL'}")
+    print("-" * 72)
+
+    for r in level_results:
+        signal = ""
+        if r["n_agree"] == r["n_models"]:
+            signal = "🔥 ALL IN"
+        elif r["n_agree"] >= r["n_models"] - 1:
+            signal = "✅ STRONG"
+        elif r["n_agree"] >= min_models:
+            signal = "👀 WATCH"
+        else:
+            signal = "⚪ WEAK"
+
+        row = (f"{r['level']:>12,.2f} {r['dist_atr']:>6.1f}x "
+               f"{r['touch_count']:>4} {r['age_bars']:>5}")
+        for name in model_names:
+            s = r["scores"][name]
+            row += f"  {s:>6.1%}"
+        row += f"  {r['avg_score']:>6.1%}  {r['n_agree']}/{r['n_models']}     {signal}"
+        print(row)
+
+    # ── High conviction zones ─────────────────────────────────────────────────
+    strong = [r for r in level_results if r["n_agree"] >= min_models]
+
+    if strong:
+        print(f"\n{SEP}")
+        print("BUY ZONES — RANKED BY CONSENSUS")
+        print(SEP)
+
+        for i, r in enumerate(strong, 1):
+            level   = r["level"]
+            sl      = level - SL_ATR * atr_val
+            risk    = abs(level - sl)
+            tp      = level + TP_R * risk
+            rsk_usd = risk * 2
+            tp_usd  = risk * TP_R * 2
+
+            if r["n_agree"] == r["n_models"]:
+                label = "🔥 HIGHEST CONVICTION"
+            elif r["n_agree"] >= r["n_models"] - 1:
+                label = "✅ HIGH CONVICTION"
+            else:
+                label = "👀 WATCH"
+
+            # Model agreement bar
+            filled = "█" * r["n_agree"]
+            empty  = "░" * (r["n_models"] - r["n_agree"])
+            bar    = filled + empty
+
+            print(f"\n  #{i} {label}")
+            print(f"  Level    : {level:,.2f}  [{bar}] "
+                  f"{r['n_agree']}/{r['n_models']} models agree")
+            print(f"  Distance : {r['dist_atr']:.1f} ATR from price | "
+                  f"{r['touch_count']} touches | age {r['age_bars']} bars")
+
+            # Individual model scores
+            score_str = "  Scores   : "
+            for name in model_names:
+                s = r["scores"][name]
+                marker = "✓" if s >= min_consensus_score else "✗"
+                score_str += f"{name[:3]}:{s:.0%}{marker}  "
+            print(score_str)
+
+            print(f"  Entry    : {level:,.2f}")
+            print(f"  SL       : {sl:,.2f}  ({risk:.0f}pts / ${rsk_usd:.0f} risk)")
+            print(f"  TP       : {tp:,.2f}  ({risk*TP_R:.0f}pts / ${tp_usd:.0f} target)")
+
+    else:
+        print(f"\n  No levels with {min_models}+ model consensus found.")
+        print(f"  Current market may not have clear buy zones.")
+
+    print(f"\n{SEP}")
+    print(f"Threshold: {min_consensus_score:.0%} per model | "
+          f"Min consensus: {min_models}/{len(model_names)} models")
+    print(f"Ensemble models saved → ensemble_models.joblib")
+    print(SEP)
+
+    return level_results
+
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Key Levels ML Pipeline")
-    parser.add_argument("--mode",      choices=["collect", "train", "validate", "scan", "study", "backtest", "retrain"],
+    parser.add_argument("--mode",      choices=["collect", "train", "validate", "scan", "study", "backtest", "retrain", "ensemble"],
                         required=True)
     parser.add_argument("--symbol",    default="@MNQ")
     parser.add_argument("--tf",        default="H1", choices=list(TF_LABEL_MAP.keys()))
@@ -1826,6 +2294,9 @@ if __name__ == "__main__":
         study(symbol=args.symbol, tf_label=args.tf, min_score=args.threshold)
     elif args.mode == "retrain":
         retrain(symbol=args.symbol, tf_label=args.tf, n_bars=args.bars)
+    elif args.mode == "ensemble":
+        ensemble(symbol=args.symbol, tf_label=args.tf, n_bars=args.bars,
+                 min_consensus_score=args.threshold)
     elif args.mode == "backtest":
         backtest(
             symbol=args.symbol,

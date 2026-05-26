@@ -443,6 +443,27 @@ def mark_alerted(level_price, score, last_alert, atr_val):
 # TELEGRAM
 # ─────────────────────────────────────────────────────────────────────────────
 
+def score_level_ensemble(ensemble_data, X_row, min_score):
+    """Score a level with all ensemble models. Returns dict of scores + consensus."""
+    if ensemble_data is None:
+        return None
+    scores = {}
+    for name, m_info in ensemble_data["models"].items():
+        try:
+            scores[name] = float(m_info["model"].predict_proba(X_row)[0, 1])
+        except Exception:
+            scores[name] = 0.0
+    n_models  = len(scores)
+    n_agree   = sum(1 for s in scores.values() if s >= min_score)
+    avg_score = float(np.mean(list(scores.values())))
+    return {
+        "scores":    scores,
+        "n_agree":   n_agree,
+        "n_models":  n_models,
+        "avg_score": avg_score,
+    }
+
+
 def send_telegram(message: str) -> bool:
     if TELEGRAM_TOKEN == "YOUR_BOT_TOKEN_HERE":
         log.warning("Telegram not configured — printing to console only")
@@ -491,11 +512,24 @@ def format_alert(strong_levels, watch_levels, trend_info,
             sl  = lv["level"] - SL_ATR * atr_val
             tp  = lv["level"] + TP_R * abs(lv["level"] - sl)
             rsk = abs(lv["level"] - sl)
+            ens = lv.get("ensemble")
+            if ens:
+                n_a = ens["n_agree"]
+                n_m = ens["n_models"]
+                bar = "█" * n_a + "░" * (n_m - n_a)
+                consensus_str = f" | [{bar}] {n_a}/{n_m}"
+                score_detail = "  ".join(
+                    f"{k[:3]}:{v:.0%}" for k,v in ens["scores"].items())
+            else:
+                consensus_str = ""
+                score_detail  = f"score {lv['score']:.0%}"
             lines.append(
-                f"  📍 <b>{lv['level']:,.2f}</b> | score {lv['score']:.0%} | "
-                f"{lv['dist_atr']:.1f} ATR away | {lv['touch_count']} touches | "
-                f"age {lv['age_bars']}bars"
+                f"  📍 <b>{lv['level']:,.2f}</b> | avg {lv['score']:.0%}"
+                f"{consensus_str} | {lv['dist_atr']:.1f} ATR | "
+                f"{lv['touch_count']} touches | age {lv['age_bars']}bars"
             )
+            if ens:
+                lines.append(f"     {score_detail}")
             lines.append(
                 f"     Entry: {lv['level']:,.2f}  SL: {sl:,.2f}  TP: {tp:,.2f}"
             )
@@ -508,11 +542,20 @@ def format_alert(strong_levels, watch_levels, trend_info,
     if watch_levels:
         lines.append("👀 <b>WATCH (60–75%)</b>")
         for lv in watch_levels:
-            sl = lv["level"] - SL_ATR * atr_val
-            tp = lv["level"] + TP_R * abs(lv["level"] - sl)
+            sl  = lv["level"] - SL_ATR * atr_val
+            tp  = lv["level"] + TP_R * abs(lv["level"] - sl)
+            ens = lv.get("ensemble")
+            if ens:
+                n_a = ens["n_agree"]
+                n_m = ens["n_models"]
+                bar = "█" * n_a + "░" * (n_m - n_a)
+                consensus_str = f" | [{bar}] {n_a}/{n_m}"
+            else:
+                consensus_str = ""
             lines.append(
-                f"  📍 {lv['level']:,.2f} | score {lv['score']:.0%} | "
-                f"{lv['dist_atr']:.1f} ATR away | {lv['touch_count']} touches"
+                f"  📍 {lv['level']:,.2f} | avg {lv['score']:.0%}"
+                f"{consensus_str} | {lv['dist_atr']:.1f} ATR | "
+                f"{lv['touch_count']} touches"
             )
             lines.append(
                 f"     Entry: {lv['level']:,.2f}  SL: {sl:,.2f}  TP: {tp:,.2f}"
@@ -568,6 +611,16 @@ def main():
     saved     = joblib.load(MODEL_PATH)
     model     = saved["model"]
     feat_cols = saved["features"]
+
+    # Load ensemble models if available
+    ENSEMBLE_PATH = "ensemble_models.joblib"
+    ensemble_data = None
+    if os.path.exists(ENSEMBLE_PATH):
+        try:
+            ensemble_data = joblib.load(ENSEMBLE_PATH)
+            log.info(f"Ensemble models loaded: {ensemble_data['model_names']}")
+        except Exception as e:
+            log.warning(f"Could not load ensemble models: {e}")
 
     # ── Connect MT5 ───────────────────────────────────────────────────────────
     try:
