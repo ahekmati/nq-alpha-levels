@@ -121,6 +121,8 @@ def calc_atr_percentile(atr_series: pd.Series, window: int = 100) -> pd.Series:
     return atr_series.rolling(window).rank(pct=True)
 
 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. Stage 1 — Swing low detection
 # ─────────────────────────────────────────────────────────────────────────────
@@ -267,6 +269,8 @@ def extract_features(df: pd.DataFrame, htf_df: pd.DataFrame,
     htf_ema50  = calc_ema(htf_df["close"], 50)
     htf_atr    = calc_atr(htf_df, ATR_PERIOD)
 
+
+
     records = []
 
     for r in retests:
@@ -380,6 +384,8 @@ def extract_features(df: pd.DataFrame, htf_df: pd.DataFrame,
                     outcome = 1   # target hit
                     break
 
+
+
         records.append({
             "timestamp":            ts,
             # Level quality
@@ -416,6 +422,7 @@ def extract_features(df: pd.DataFrame, htf_df: pd.DataFrame,
             "dist_round_number":    dist_round,
             # Entry geometry
             "risk_atr":             risk / atr_val if atr_val > 0 else 0,
+
             # Label
             "outcome":              outcome,
         })
