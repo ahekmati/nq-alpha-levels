@@ -65,6 +65,24 @@ LAST_ALERT_PATH  = "logs/last_alert.json"
 # Suppress duplicate alerts — don't re-alert same level within N hours
 SUPPRESS_HOURS   = 4
 
+# ── AUTO TRADE CONFIG ──────────────────────────────────────────────────────────
+# Set AUTO_TRADE = True to automatically place limit orders when signals fire
+# Set AUTO_TRADE = False for alert-only mode (default, safe)
+AUTO_TRADE          = True
+
+# Only auto-trade STRONG signals (75%+). WATCH signals (60-75%) alert only.
+AUTO_TRADE_MIN_SCORE = 0.75
+
+# Contract size — always 1 MNQ
+AUTO_TRADE_VOLUME   = 1.0
+
+# Magic number to identify bot orders in MT5
+AUTO_TRADE_MAGIC    = 20260002
+
+# State file to track pending orders across cron runs
+ORDER_STATE_PATH    = "logs/order_state.json"
+# ──────────────────────────────────────────────────────────────────────────────
+
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -464,6 +482,194 @@ def score_level_ensemble(ensemble_data, X_row, min_score):
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTO TRADE — Position gate + order placement
+# ─────────────────────────────────────────────────────────────────────────────
+
+def any_position_open() -> bool:
+    """
+    BULLETPROOF GATE: Check ALL open positions in the entire MT5 terminal.
+    Returns True if ANY position exists regardless of symbol or magic number.
+    This is checked FIRST before any order is placed — no exceptions.
+    Called twice: once before scoring, once immediately before order_send.
+    """
+    try:
+        positions = mt5.positions_get()
+        if positions is None:
+            # None = error querying MT5 — treat conservatively as position exists
+            log.warning(f"positions_get() returned None: {mt5.last_error()}")
+            return True
+        count = len(positions)
+        if count > 0:
+            syms = [p.symbol for p in positions]
+            log.info(f"GATE BLOCKED: {count} open position(s) in terminal: {syms}")
+            return True
+        return False
+    except Exception as e:
+        log.warning(f"Position check error: {e} — treating as position open")
+        return True  # fail safe — never place order on error
+
+
+def any_pending_order_exists(symbol: str) -> bool:
+    """Check if a bot-placed pending order already exists for this symbol."""
+    try:
+        orders = mt5.orders_get(symbol=symbol)
+        if orders is None:
+            return False
+        bot_orders = [o for o in orders if o.magic == AUTO_TRADE_MAGIC]
+        if bot_orders:
+            log.info(f"Pending bot order exists for {symbol} — skipping")
+            return True
+        return False
+    except Exception as e:
+        log.warning(f"Pending order check error: {e}")
+        return True  # fail safe
+
+
+def load_order_state() -> dict:
+    if os.path.exists(ORDER_STATE_PATH):
+        try:
+            with open(ORDER_STATE_PATH) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"pending_ticket": None, "placed_at": None,
+            "level": None, "sl": None, "tp": None,
+            "bars_since_placed": 0}
+
+
+def save_order_state(state: dict):
+    with open(ORDER_STATE_PATH, "w") as f:
+        json.dump(state, f, indent=2, default=str)
+
+
+def clear_order_state():
+    save_order_state({"pending_ticket": None, "placed_at": None,
+                      "level": None, "sl": None, "tp": None,
+                      "bars_since_placed": 0})
+
+
+def check_and_cleanup_pending(symbol: str) -> bool:
+    """
+    Check if our previously placed order is still pending.
+    If it filled → clear state, return False (no pending).
+    If it expired (>3 bars) → cancel it, clear state, return False.
+    Returns True if order is still pending and valid.
+    """
+    state = load_order_state()
+    if state.get("pending_ticket") is None:
+        return False
+
+    ticket = state["pending_ticket"]
+    state["bars_since_placed"] = state.get("bars_since_placed", 0) + 1
+
+    # Check if order still exists
+    orders = mt5.orders_get(symbol=symbol)
+    tickets = [o.ticket for o in orders] if orders else []
+
+    if ticket not in tickets:
+        # Order gone — either filled or externally cancelled
+        positions = mt5.positions_get(symbol=symbol)
+        filled = [p for p in (positions or []) if p.magic == AUTO_TRADE_MAGIC]
+        if filled:
+            log.info(f"✅ Order #{ticket} filled → position open")
+        else:
+            log.info(f"Order #{ticket} no longer pending (cancelled/expired)")
+        clear_order_state()
+        return False
+
+    # Order still pending — check expiry
+    if state["bars_since_placed"] >= 3:
+        log.info(f"⏰ Order #{ticket} expired after 3 bars — cancelling")
+        req = {"action": mt5.TRADE_ACTION_REMOVE, "order": ticket}
+        result = mt5.order_send(req)
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            log.info(f"Order #{ticket} cancelled successfully")
+            send_telegram(f"⏰ Limit order #{ticket} expired unfilled — cancelled")
+        else:
+            log.warning(f"Cancel failed for #{ticket}: "
+                        f"{result.retcode if result else 'no result'}")
+        clear_order_state()
+        return False
+
+    save_order_state(state)
+    log.info(f"Pending order #{ticket} still active "
+             f"({state['bars_since_placed']}/3 bars)")
+    return True
+
+
+def place_limit_order_mt5linux(symbol: str, level: float,
+                                sl: float, tp: float) -> int:
+    """
+    Place a buy limit order via mt5linux.
+    Returns ticket number on success, -1 on failure.
+
+    FINAL GATE: checks for open positions one last time immediately
+    before sending the order. If anything is open — aborts.
+    """
+    # ── FINAL bulletproof position check — last line of defense ──────────────
+    if any_position_open():
+        log.warning("FINAL GATE BLOCKED: position detected immediately "
+                    "before order_send — aborting")
+        return -1
+
+    if any_pending_order_exists(symbol):
+        log.warning("FINAL GATE BLOCKED: pending order exists — aborting")
+        return -1
+
+    # Get symbol info for tick size
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        log.error(f"Symbol info not found for {symbol}")
+        return -1
+
+    tick = info.trade_tick_size
+    if tick <= 0:
+        tick = 0.25  # MNQ default
+
+    # Round to tick size
+    def round_tick(price):
+        return round(round(price / tick) * tick, info.digits)
+
+    price_r = round_tick(level)
+    sl_r    = round_tick(sl)
+    tp_r    = round_tick(tp)
+
+    request = {
+        "action":        mt5.TRADE_ACTION_PENDING,
+        "symbol":        symbol,
+        "volume":        float(AUTO_TRADE_VOLUME),
+        "type":          mt5.ORDER_TYPE_BUY_LIMIT,
+        "price":         price_r,
+        "sl":            sl_r,
+        "tp":            tp_r,
+        "deviation":     10,
+        "magic":         AUTO_TRADE_MAGIC,
+        "comment":       "nq_alpha_bot",
+        "type_time":     mt5.ORDER_TIME_GTC,
+        "type_filling":  mt5.ORDER_FILLING_IOC,
+    }
+
+    log.info(f"Placing limit order: {symbol} BUY LIMIT @ {price_r} "
+             f"SL={sl_r} TP={tp_r} vol={AUTO_TRADE_VOLUME}")
+
+    result = mt5.order_send(request)
+
+    if result is None:
+        log.error(f"order_send returned None: {mt5.last_error()}")
+        return -1
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        log.error(f"Order failed | retcode={result.retcode} | "
+                  f"comment={getattr(result, 'comment', 'n/a')}")
+        return -1
+
+    ticket = result.order
+    log.info(f"✅ ORDER PLACED | #{ticket} | {symbol} BUY LIMIT @ {price_r} | "
+             f"SL={sl_r} TP={tp_r}")
+    return ticket
+
+
 def send_telegram(message: str) -> bool:
     if TELEGRAM_TOKEN == "YOUR_BOT_TOKEN_HERE":
         log.warning("Telegram not configured — printing to console only")
@@ -637,6 +843,24 @@ def main():
         symbol = get_front_month_symbol(SYMBOL_PREFIX)
         log.info(f"Symbol: {symbol}")
 
+        # ── GATE 1: Check for open positions BEFORE doing anything else ───────
+        # This is the outermost guard — if anything is open we don't even
+        # scan for levels. Saves processing and prevents any race condition.
+        if AUTO_TRADE and any_position_open():
+            log.info("AUTO_TRADE: position open in terminal — skipping scan entirely")
+            mt5.shutdown()
+            log.info("=== SCAN END — position open, no scan ===\n")
+            return
+
+        # ── GATE 2: Check if we have a pending order still waiting ───────────
+        if AUTO_TRADE:
+            has_pending = check_and_cleanup_pending(symbol)
+            if has_pending:
+                log.info("AUTO_TRADE: pending order still active — skipping scan")
+                mt5.shutdown()
+                log.info("=== SCAN END — pending order exists ===\n")
+                return
+
         tf  = TIMEFRAME_MAP[TF_LABEL]
         htf = HTF_MAP.get(tf, 16388)
 
@@ -746,6 +970,65 @@ def main():
         send_telegram(message)
 
         log.info(f"Alert sent | strong={len(strong_levels)} watch={len(watch_levels)}")
+
+        # ── AUTO TRADE: place limit order if enabled ──────────────────────────
+        if AUTO_TRADE and strong_levels:
+            # Only auto-trade the BEST strong level (highest score)
+            best = max(strong_levels, key=lambda x: x["score"])
+
+            if best["score"] >= AUTO_TRADE_MIN_SCORE:
+                # GATE 3: Final position check immediately before order
+                if any_position_open():
+                    log.warning("AUTO_TRADE GATE 3: position opened between "
+                                "scan and order — aborting")
+                    send_telegram(
+                        f"⚠️ Auto-trade aborted\n"
+                        f"Position detected before order placement\n"
+                        f"Level {best['level']:,.2f} — check manually"
+                    )
+                else:
+                    sl     = best["level"] - SL_ATR * atr_val
+                    tp     = best["level"] + TP_R * abs(best["level"] - sl)
+                    risk   = abs(best["level"] - sl)
+
+                    ticket = place_limit_order_mt5linux(
+                        symbol = symbol,
+                        level  = best["level"],
+                        sl     = sl,
+                        tp     = tp,
+                    )
+
+                    if ticket > 0:
+                        # Save order state for tracking across cron runs
+                        save_order_state({
+                            "pending_ticket":    ticket,
+                            "placed_at":         datetime.now(timezone.utc).isoformat(),
+                            "level":             best["level"],
+                            "sl":                sl,
+                            "tp":                tp,
+                            "bars_since_placed": 0,
+                        })
+
+                        order_msg = (
+                            f"\n✅ <b>LIMIT ORDER PLACED</b>\n"
+                            f"   Ticket: #{ticket}\n"
+                            f"   Entry : {best['level']:,.2f}\n"
+                            f"   SL    : {sl:,.2f}  ({risk:.0f}pts / ${risk*2:.0f})\n"
+                            f"   TP    : {tp:,.2f}  ({risk*TP_R:.0f}pts / ${risk*TP_R*2:.0f})\n"
+                            f"   Status: Waiting for fill (expires in 3 bars)"
+                        )
+                        send_telegram(order_msg)
+                        log.info(f"AUTO_TRADE: order placed #{ticket} @ {best['level']:.2f}")
+
+                    else:
+                        log.error("AUTO_TRADE: order_send failed")
+                        send_telegram(
+                            f"❌ Auto-trade order FAILED\n"
+                            f"Level {best['level']:,.2f} — place manually"
+                        )
+            else:
+                log.info(f"AUTO_TRADE: best score {best['score']:.1%} < "
+                         f"{AUTO_TRADE_MIN_SCORE:.0%} threshold — no order placed")
 
     except Exception as e:
         log.error(f"Scan error: {e}")
