@@ -66,6 +66,8 @@ import json
 import pickle
 import sys
 import traceback
+import urllib.request
+import urllib.parse
 import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -120,6 +122,127 @@ def err(msg: str) -> None:
 
 
 # =============================================================================
+# TELEGRAM ALERTS
+# =============================================================================
+
+def tg(msg: str) -> None:
+    """
+    Send a Telegram message. Silent no-op if TELEGRAM_ENABLED is False
+    or if token/chat_id are not configured. Never crashes the main program.
+    Uses only stdlib urllib — no extra pip install needed.
+    """
+    if not TELEGRAM_ENABLED:
+        return
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        warn("Telegram enabled but TOKEN or CHAT_ID not set — skipping alert")
+        return
+    try:
+        url     = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = urllib.parse.urlencode({
+            "chat_id":    TELEGRAM_CHAT_ID,
+            "text":       msg,
+            "parse_mode": "HTML",
+        }).encode()
+        req  = urllib.request.Request(url, data=payload, method="POST")
+        resp = urllib.request.urlopen(req, timeout=10)
+        code = resp.getcode()
+        if code != 200:
+            warn(f"Telegram returned HTTP {code}")
+        else:
+            dbg(f"Telegram alert sent: {msg[:60]}...")
+    except Exception as e:
+        warn(f"Telegram alert failed (non-fatal): {e}")
+
+
+def tg_signal_fired(sig: dict) -> None:
+    """Alert when rule signal fires — before ML filter."""
+    tg(
+        f"📡 <b>ST-ML Signal</b>\n"
+        f"Time: {sig['time']}\n"
+        f"Direction: {sig['direction']}\n"
+        f"Close: {sig['close']:.2f}\n"
+        f"RSI10: {sig['rsi10']:.1f} band={sig['rsi_band']}\n"
+        f"ATR14: {sig['atr14']:.2f}\n"
+        f"Entry est: {sig['entry_estimate']:.2f}\n"
+        f"SL est: {sig['sl_estimate']:.2f}\n"
+        f"⏳ Checking ML filter..."
+    )
+
+
+def tg_ml_filtered(sig: dict) -> None:
+    """Alert when ML rejects a rule signal."""
+    tg(
+        f"🚫 <b>ST-ML Signal FILTERED</b>\n"
+        f"Time: {sig['time']}\n"
+        f"ML consensus proba: {sig.get('consensus_proba', 0):.4f} "
+        f"(threshold={CONSENSUS_PROBA_THRESHOLD})\n"
+        f"Est net USD: ${sig.get('consensus_net_usd', 0):.0f}\n"
+        f"No order sent."
+    )
+
+
+def tg_order_sent(sig: dict, order_result: dict) -> None:
+    """Alert when an order is successfully filled."""
+    tg(
+        f"✅ <b>ST-ML ORDER FILLED</b>\n"
+        f"Direction: {sig['direction']}\n"
+        f"Symbol: {SYMBOL}\n"
+        f"Ticket: {order_result.get('ticket', 'N/A')}\n"
+        f"Fill price: {order_result.get('price', 0):.2f}\n"
+        f"Volume: {order_result.get('volume', 0)}\n"
+        f"SL: {order_result.get('sl', 0):.2f}\n"
+        f"TP: {order_result.get('tp', 0):.2f if order_result.get('tp') else 'TRAIL'}\n"
+        f"ML proba: {sig.get('consensus_proba', 0):.4f}\n"
+        f"Est net USD: ${sig.get('consensus_net_usd', 0):.0f}"
+    )
+
+
+def tg_order_failed(sig: dict, order_result: dict) -> None:
+    """Alert when an order fails to fill."""
+    tg(
+        f"❌ <b>ST-ML ORDER FAILED</b>\n"
+        f"Direction: {sig['direction']}\n"
+        f"Error: {order_result.get('error', 'unknown')}\n"
+        f"Retcode: {order_result.get('retcode', 'N/A')}\n"
+        f"Comment: {order_result.get('comment', '')}"
+    )
+
+
+def tg_blocked_position(positions: list) -> None:
+    """Alert when blocked by an existing open position."""
+    pos_str = "\n".join(
+        f"  ticket={p.ticket} magic={p.magic} "
+        f"{'BUY' if p.type==0 else 'SELL'} "
+        f"profit={p.profit:.2f}"
+        for p in positions
+    )
+    tg(
+        f"🔒 <b>ST-ML BLOCKED</b> — open position exists\n"
+        f"{pos_str}\n"
+        f"No order sent."
+    )
+
+
+def tg_retrain_complete(metrics: dict, best_params: dict) -> None:
+    """Alert when model retraining completes."""
+    tg(
+        f"🔄 <b>ST-ML Model Retrained</b>\n"
+        f"AUC: {metrics.get('consensus_clf_auc', 0):.3f}\n"
+        f"Precision: {metrics.get('consensus_precision', 0):.3f}\n"
+        f"Recall: {metrics.get('consensus_recall', 0):.3f}\n"
+        f"Trades: {metrics.get('n_trades', 0)}\n"
+        f"Best params: rsi=({best_params.get('rsi_lo')},{best_params.get('rsi_hi')}) "
+        f"ST({int(best_params.get('st_period',0))},{best_params.get('st_mult',0)}) "
+        f"stop={best_params.get('stop_mult')} tp={best_params.get('tp_mode')}"
+    )
+
+
+def tg_error(context: str, error: str) -> None:
+    """Alert on critical errors."""
+    tg(f"🚨 <b>ST-ML ERROR</b>\n{context}\n{error}")
+
+
+# =============================================================================
 # USER CONFIG
 # =============================================================================
 SYMBOL = "@MNQ"
@@ -157,6 +280,21 @@ LIVE_MAGIC           = 20240101   # unique EA magic number — change if running
 LIVE_ORDER_COMMENT   = "ST_ML_v2"
 LIVE_MAX_SPREAD_PTS  = 5.0        # refuse to trade if spread > this many points
 LAST_N_TRADES        = 5          # how many recent historical trades to replay/print
+
+# =============================================================================
+# TELEGRAM CONFIG
+# =============================================================================
+# To set up:
+#   1. Message @BotFather on Telegram → /newbot → copy the token
+#   2. Message your bot once, then visit:
+#      https://api.telegram.org/bot<TOKEN>/getUpdates
+#      to find your chat_id
+#   3. Fill in both values below
+# Set TELEGRAM_ENABLED = False to disable all Telegram alerts
+# =============================================================================
+TELEGRAM_ENABLED  = True
+TELEGRAM_TOKEN    = "8602513961:AAFzTS_2lSxza7soWiF3REUA6GewIgc8Grw"  # ← REVOKE AND REPLACE WITH NEW TOKEN FROM @BotFather
+TELEGRAM_CHAT_ID  = "7902956948"
 
 WF_TRAIN_BARS = 5000
 WF_OOS_BARS   = 1000
@@ -219,34 +357,42 @@ def fetch_rates(mt5: MetaTrader5, symbol: str, tf_mins: int,
 
 def get_open_positions(mt5: MetaTrader5, symbol: str, magic: int) -> list:
     """
-    Returns list of open positions for this symbol + magic number.
-    BULLET-PROOF: checks both symbol variants and handles None return.
+    Returns ALL open positions for this symbol regardless of magic number.
+    This ensures System 1 and System 2 cannot both be in a trade simultaneously.
+    magic param kept for logging only — NOT used to filter.
     """
-    dbg(f"Checking open positions for {symbol} magic={magic}...")
+    dbg(f"Checking ALL open positions for {symbol} (any magic)...")
     positions = mt5.positions_get(symbol=symbol)
     if positions is None:
         dbg(f"positions_get returned None (no positions or error): {mt5.last_error()}")
         return []
-    # Filter by magic number to avoid interfering with other EAs
-    filtered = [p for p in positions if p.magic == magic]
-    dbg(f"Found {len(positions)} total positions, {len(filtered)} with magic={magic}")
+    # CRITICAL: return ALL positions on this symbol — not just our magic
+    # This prevents System 2 opening while System 1 is in a trade and vice versa
+    filtered = list(positions)
+    own      = [p for p in positions if p.magic == magic]
+    other    = [p for p in positions if p.magic != magic]
+    dbg(f"Found {len(filtered)} total positions on {symbol} "
+        f"({len(own)} ours magic={magic}, {len(other)} other systems)")
     return filtered
 
 
 def has_open_position(mt5: MetaTrader5, symbol: str, magic: int) -> bool:
     """
-    Returns True if there is already an open position for this symbol/magic.
+    Returns True if there is ANY open position on this symbol.
+    Blocks regardless of which system opened it — System 1 or System 2.
     This is the PRIMARY guard — no order is ever sent if this returns True.
     """
     positions = get_open_positions(mt5, symbol, magic)
     if positions:
         for p in positions:
-            warn(f"Open position exists: ticket={p.ticket} "
+            own_flag = " [OURS]" if p.magic == magic else " [OTHER SYSTEM]"
+            warn(f"Open position exists{own_flag}: ticket={p.ticket} "
+                 f"magic={p.magic} "
                  f"type={'BUY' if p.type==0 else 'SELL'} "
-                 f"vol={p.volume} price={p.price_open} "
+                 f"vol={p.volume} price={p.price_open:.2f} "
                  f"profit={p.profit:.2f}")
         return True
-    dbg("No open positions found — clear to trade")
+    dbg("No open positions on symbol — clear to trade")
     return False
 
 
@@ -1541,10 +1687,14 @@ def run_live(full_df: pd.DataFrame, best_params: dict,
         status("NO SIGNAL — rule conditions not met. No order sent.")
         return
 
+    # Rule signal fired — alert Telegram
+    tg_signal_fired(sig)
+
     # ── GATE 2: ML must confirm ────────────────────────────────────
     if not sig["take_trade"]:
         status("SIGNAL FILTERED BY ML — consensus proba below threshold. "
                "No order sent.")
+        tg_ml_filtered(sig)
         return
 
     # ── GATE 3: Open position guard ───────────────────────────────
@@ -1552,15 +1702,19 @@ def run_live(full_df: pd.DataFrame, best_params: dict,
     status("Signal confirmed — connecting MT5 for position check...")
     mt5 = initialize_mt5()
     try:
-        # PRIMARY GUARD: check for any open position
+        # PRIMARY GUARD: check for any open position on this symbol
         if has_open_position(mt5, SYMBOL, LIVE_MAGIC):
             status("BLOCKED — open position already exists. "
                    "No order sent. Will check again next bar.")
+            positions = mt5.positions_get(symbol=SYMBOL) or []
+            tg_blocked_position(list(positions))
             return
 
         # ── GATE 4: Spread check ───────────────────────────────────
         if not check_spread(mt5, SYMBOL, LIVE_MAX_SPREAD_PTS):
             status("BLOCKED — spread too wide. No order sent.")
+            tg(f"⚠️ <b>ST-ML BLOCKED</b> — spread too wide on {SYMBOL}. "
+               f"No order sent.")
             return
 
         # ── EXECUTE ────────────────────────────────────────────────
@@ -1587,9 +1741,11 @@ def run_live(full_df: pd.DataFrame, best_params: dict,
                    f"price={order_result['price']:.2f} "
                    f"vol={order_result['volume']}")
             sig["order_result"] = order_result
+            tg_order_sent(sig, order_result)
         else:
             err(f"ORDER FAILED: {order_result['error']}")
             sig["order_result"] = order_result
+            tg_order_failed(sig, order_result)
 
         # Update state file with order result
         with open(LIVE_STATE_FILE, "w") as f:
@@ -1598,6 +1754,7 @@ def run_live(full_df: pd.DataFrame, best_params: dict,
     except Exception as e:
         err(f"Live execution exception: {e}")
         traceback.print_exc()
+        tg_error("run_live execution", str(e))
     finally:
         mt5.shutdown()
         dbg("MT5 connection closed")
@@ -1783,6 +1940,9 @@ def main() -> None:
 
             # Save to disk for future runs
             save_model(final_result, best_params)
+
+            # Telegram alert — retrain complete
+            tg_retrain_complete(m, best_params)
 
         else:
             # ── Load from disk — fast path (~1 second) ─────────────
