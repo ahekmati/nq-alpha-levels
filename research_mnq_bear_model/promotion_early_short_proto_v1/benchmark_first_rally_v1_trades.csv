@@ -1,3 +1,0 @@
-signal,entry_time,exit_time,entry_price,exit_price,gross_points,gross_dollars,net_dollars,exit_reason,bear_window_id,hours_from_bear_start,bear_prob,exhaust_prob,daily_model_rsi,daily_model_adx,proto_has_rsi70_context,proto_has_stall_or_reject,stop_points,time_exit_h,mode,r_mult
-benchmark_first_rally_v1,2021-04-30 14:00:00+00:00,2021-05-04 12:00:00+00:00,13798.5,13585.0,213.5,427.0,425.5,time_exit_48h,5.0,110.0,0.4173174638979151,0.0153480064394524,54.30188718414678,14.077882281376914,0,1,300.0,48,stop_time,2.0
-benchmark_first_rally_v1,2021-12-31 14:00:00+00:00,2022-01-04 16:00:00+00:00,16720.5,16534.25,186.25,372.5,371.0,time_exit_48h,6.0,110.0,0.4495212018636503,0.027436146413398,56.42849313764937,17.05548216991898,0,1,300.0,48,stop_time,2.0

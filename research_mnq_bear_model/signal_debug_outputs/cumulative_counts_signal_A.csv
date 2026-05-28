@@ -1,6 +1,0 @@
-pipeline,step,condition,remaining_rows,remaining_pct
-signal_A_pipeline,1,is_early_window,1619,100.0
-signal_A_pipeline,2,in_session,483,29.83323038912909
-signal_A_pipeline,3,upper_range_failure,7,0.4323656578134651
-signal_A_pipeline,4,soft_daily_weakening,2,0.12353304508956146
-signal_A_pipeline,5,soft_slope_condition,0,0.0
