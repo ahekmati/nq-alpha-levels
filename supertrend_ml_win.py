@@ -2003,6 +2003,79 @@ def model_needs_retrain(force: bool = False) -> bool:
 
 
 # =============================================================================
+# RSI ZONE BREAKDOWN ANALYSIS
+# =============================================================================
+
+def print_rsi_zone_breakdown(oos_trades: pd.DataFrame) -> None:
+    """
+    Break down OOS trade performance by daily RSI10 zone at entry.
+    Helps answer: are RSI>70 flips actually better in strong trends?
+    Shows both unfiltered and ML-filtered results per zone.
+    """
+    if oos_trades.empty or "rsi10" not in oos_trades.columns:
+        print("\n[RSI ZONE] rsi10 column not found in OOS trades — skipping")
+        return
+
+    zones = [
+        ("40-50",  40,  50),
+        ("50-55",  50,  55),
+        ("55-60",  55,  60),
+        ("60-65",  60,  65),
+        ("65-70",  65,  70),
+        ("70-75",  70,  75),
+        ("75-80",  75,  80),
+        ("80+",    80, 100),
+    ]
+
+    sep = "=" * 75
+    print(f"\n{sep}")
+    print("RSI10 ZONE BREAKDOWN — OOS Trade Performance by Daily RSI at Entry")
+    print(sep)
+    print(f"  {'Zone':<8} {'N':>5} {'WR':>7} {'ExpectUSD':>10} {'PF':>7} "
+          f"{'TotalUSD':>10} {'ML_N':>6} {'ML_WR':>7} {'ML_Exp':>9}")
+    print("  " + "-" * 71)
+
+    for label, lo, hi in zones:
+        mask = (oos_trades["rsi10"] >= lo) & (oos_trades["rsi10"] < hi)
+        sub  = oos_trades[mask]
+        if len(sub) == 0:
+            continue
+
+        # Unfiltered
+        n    = len(sub)
+        wins = (sub["net_usd"] > 0).sum()
+        wr   = wins / n
+        exp  = sub["net_usd"].mean()
+        tot  = sub["net_usd"].sum()
+        gl   = sub.loc[sub["net_usd"] < 0, "net_usd"].abs().sum()
+        gp   = sub.loc[sub["net_usd"] > 0, "net_usd"].sum()
+        pf   = gp / gl if gl > 0 else float("inf")
+
+        # ML filtered
+        ml_col = "take_trade" if "take_trade" in sub.columns else None
+        if ml_col and sub[ml_col].any():
+            ml   = sub[sub[ml_col] == True]
+            ml_n = len(ml)
+            ml_w = (ml["net_usd"] > 0).sum()
+            ml_wr = ml_w / ml_n if ml_n > 0 else 0
+            ml_exp = ml["net_usd"].mean() if ml_n > 0 else 0
+            ml_str = f"{ml_n:>6} {ml_wr:>7.1%} {ml_exp:>+9.0f}"
+        else:
+            ml_str = f"{'—':>6} {'—':>7} {'—':>9}"
+
+        # Flag the best zones
+        flag = " ◀ strong" if wr >= 0.65 and n >= 5 else ""
+
+        print(f"  {label:<8} {n:>5} {wr:>7.1%} {exp:>+10.0f} {pf:>7.2f} "
+              f"{tot:>+10.0f} {ml_str}{flag}")
+
+    print(sep)
+    print("  Zones with N<5 may not be statistically meaningful.")
+    print("  ML filtered = trades where ML consensus said take_trade=True.")
+    print(sep)
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -2117,6 +2190,7 @@ def main() -> None:
         return
 
     print_wf_report(oos_trades)
+    print_rsi_zone_breakdown(oos_trades)
 
     # ── FINAL MODEL ─────────────────────────────────────────────────
     status("Training final model on last window...")
