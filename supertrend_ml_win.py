@@ -1478,6 +1478,7 @@ def walk_forward_eval(full_df: pd.DataFrame) -> pd.DataFrame:
                 "fold":              fold_num,
                 "rsi_lo":            best["rsi_lo"],
                 "rsi_hi":            best["rsi_hi"],
+                "rsi10":             float(row.get("rsi10", np.nan)),
                 "st_period":         st_period,
                 "st_mult":           st_mult_v,
                 "consensus_proba":   np.nan,
@@ -2052,9 +2053,9 @@ def print_rsi_zone_breakdown(oos_trades: pd.DataFrame) -> None:
         pf   = gp / gl if gl > 0 else float("inf")
 
         # ML filtered
-        ml_col = "take_trade" if "take_trade" in sub.columns else None
-        if ml_col and sub[ml_col].any():
-            ml   = sub[sub[ml_col] == True]
+        ml_col = "take_trade_ml" if "take_trade_ml" in sub.columns else None
+        if ml_col and (sub[ml_col] == 1).any():
+            ml   = sub[sub[ml_col] == 1]
             ml_n = len(ml)
             ml_w = (ml["net_usd"] > 0).sum()
             ml_wr = ml_w / ml_n if ml_n > 0 else 0
