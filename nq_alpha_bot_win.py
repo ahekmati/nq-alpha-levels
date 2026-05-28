@@ -1106,6 +1106,8 @@ if __name__ == "__main__":
                         help="Show last N signals from history: --history 10")
     parser.add_argument("--test", action="store_true",
                         help="Test Telegram connection only")
+    parser.add_argument("--test-order", action="store_true",
+                        help="Place a real test limit order 50pts below current price to verify MT5 order flow. Cancel manually after.")
     args = parser.parse_args()
 
     if args.test:
@@ -1114,6 +1116,38 @@ if __name__ == "__main__":
                f"Telegram connection working!")
         success = send_telegram(msg)
         print("Telegram test:", "OK" if success else "FAILED")
+
+    elif args.test_order:
+        import MetaTrader5 as mt5
+        if not mt5.initialize():
+            print(f"MT5 connect failed: {mt5.last_error()}")
+        else:
+            symbol = get_front_month_symbol(SYMBOL_PREFIX)
+            tick   = mt5.symbol_info_tick(symbol)
+            if tick is None:
+                print(f"Could not get tick for {symbol}")
+            else:
+                price  = tick.bid
+                entry  = round(price - 50, 2)   # 50 pts below current price
+                sl     = round(entry - 100, 2)   # 100 pts stop
+                tp     = round(entry + 200, 2)   # 200 pts target (2R)
+                print(f"TEST ORDER: {symbol} BUY LIMIT @ {entry}  SL={sl}  TP={tp}")
+                print(f"Current price: {price}")
+                ticket = place_limit_order_mt5linux(symbol, entry, sl, tp)
+                if ticket > 0:
+                    print(f"✅ Test order placed — ticket #{ticket}")
+                    print(f"Check MT5 terminal — cancel it manually when done")
+                    send_telegram(
+                        f"🧪 <b>TEST ORDER PLACED</b>\n"
+                        f"Symbol: {symbol}\n"
+                        f"BUY LIMIT @ {entry}\n"
+                        f"SL={sl}  TP={tp}\n"
+                        f"Ticket: #{ticket}\n"
+                        f"⚠️ Cancel manually after verifying"
+                    )
+                else:
+                    print("❌ Test order failed — check logs")
+            mt5.shutdown()
 
     elif args.update:
         level_price = float(args.update[0])
