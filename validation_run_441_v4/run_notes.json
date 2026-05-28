@@ -1,0 +1,16 @@
+{
+  "hard_stop_points": 200.0,
+  "hard_stop_usd": 400.0,
+  "default_costs": {
+    "commission_per_side_usd": 0.62,
+    "slippage_points_per_side": 0.5
+  },
+  "notes": [
+    "Each variant rebuilds its own features and signals",
+    "Hard stop distance capped at 200 points / $400 for MNQ",
+    "Cooldown of 48 H1 bars after 2 consecutive losing trades",
+    "Initial target arms trailing logic instead of forced exit",
+    "Walk-forward uses 3-year train / 12-month test rolling slices",
+    "Ranking prioritizes walk-forward average PF first"
+  ]
+}

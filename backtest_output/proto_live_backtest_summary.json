@@ -1,0 +1,33 @@
+{
+  "rule_name": "early_short_proto_v1",
+  "data_file": "/home/ronin/projects/mt5-python/research_mnq_bear_model/promotion_early_short_proto_v1/h1_execution_dataset_with_proto_v1.csv",
+  "trade_count": 1,
+  "last_n": 5,
+  "last_n_available": 1,
+  "total_net_dollars": -605.5,
+  "avg_net_dollars": -605.5,
+  "win_rate": 0.0,
+  "files": {
+    "all_trades_csv": "/home/ronin/projects/mt5-python/backtest_output/proto_live_backtest_all_trades.csv",
+    "last5_csv": "/home/ronin/projects/mt5-python/backtest_output/proto_live_backtest_last5_trades.csv"
+  },
+  "last5_preview": [
+    {
+      "signal_time": "2026-01-30T14:00:00+00:00",
+      "entry_time": "2026-01-30T15:00:00+00:00",
+      "exit_time": "2026-04-15T19:00:00+00:00",
+      "entry_price": 26063.0,
+      "exit_price": 26365.0,
+      "stop_price": 26363.0,
+      "target_price": 0.0,
+      "stop_points": 300.0,
+      "tp_points": 0.0,
+      "r_mult": 2.0,
+      "exit_reason": "stop",
+      "gross_points": -302.0,
+      "gross_dollars": -604.0,
+      "net_dollars": -605.5,
+      "bars_held": 1213
+    }
+  ]
+}

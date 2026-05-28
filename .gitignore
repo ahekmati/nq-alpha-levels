@@ -26,3 +26,31 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# Model files (large, rebuilt on each run)
+mnq_model.pkl
+mnq_best_params.pkl
+
+# Output data files
+mnq_oos_trades.csv
+mnq_param_search.csv
+mnq_live_signal.json
+mnq_live_state.json
+live_log.txt
+research_log.txt
+
+# Numba cache
+__numba_cache__/
+.numba_cache/
+
+# Environment
+.env
+*.env

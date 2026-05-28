@@ -1,0 +1,2 @@
+artifact_name,source_file,dataset_start_utc,dataset_end_utc,selected_signal,benchmark_signal,enabled,stop_points,time_exit_h,mode,r_mult,promoted_trade_count,research_status,rsi_context_role,notes
+early_short_proto_v1,research_mnq_bear_model/early_entry_v3_outputs/h1_with_early_signals_v3.csv,2020-01-01 23:00:00+00:00,2026-05-16 06:00:00+00:00,signal_v3_A_core,signal_v3_E_first_rally,1,300.0,48,stop_time,2.0,8,promoted_to_proto,tag_only,Promotion artifact created from early_entries_v3 results.

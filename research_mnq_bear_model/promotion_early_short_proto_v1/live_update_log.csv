@@ -1,0 +1,4 @@
+ts_utc,event_type,message,signal_symbol,rows,latest_bar_utc,latest_closed_bar_utc,latest_closed_signal,output_file,symbol_root,resolved_symbol,auto_contract_rollover,active_quarter_year,active_quarter_month,roll_date
+2026-05-16T18:24:39.260045+00:00,LIVE_UPDATE_OK,Updated live proto dataset,@MNQ,2500.0,2026-05-16 06:00:00+00:00,2026-05-16 06:00:00+00:00,0.0,research_mnq_bear_model/promotion_early_short_proto_v1/h1_execution_dataset_with_proto_v1.csv,,,,,,
+2026-05-16T18:29:17.373860+00:00,START,Starting live proto dataset update,,,,,,,MNQ,MNQM26,True,2026.0,6.0,2026-06-15
+2026-05-16T18:29:17.586609+00:00,LIVE_UPDATE_OK,Updated live proto dataset,,2500.0,2026-05-15 20:00:00+00:00,2026-05-15 20:00:00+00:00,0.0,research_mnq_bear_model/promotion_early_short_proto_v1/h1_execution_dataset_with_proto_v1.csv,MNQ,MNQM26,True,,,

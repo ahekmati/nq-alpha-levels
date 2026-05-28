@@ -1,0 +1,8 @@
+bear_window_id,proto_trades,proto_total_net_dollars,proto_avg_net_dollars,proto_win_rate,proto_avg_points,proto_avg_hours_from_start,bench_trades,bench_total_net_dollars,bench_avg_net_dollars,bench_win_rate,bench_avg_points,bench_avg_hours_from_start
+4.0,1.0,590.5,590.5,1.0,296.0,92.0,,,,,,
+5.0,,,,,,,1.0,425.5,425.5,1.0,213.5,110.0
+6.0,,,,,,,1.0,371.0,371.0,1.0,186.25,110.0
+7.0,3.0,3436.5,1145.5,1.0,573.5,42.333333333333336,,,,,,
+9.0,1.0,538.0,538.0,1.0,269.75,110.0,,,,,,
+10.0,2.0,1422.5,711.25,1.0,356.375,99.0,,,,,,
+11.0,1.0,1091.0,1091.0,1.0,546.25,66.0,,,,,,

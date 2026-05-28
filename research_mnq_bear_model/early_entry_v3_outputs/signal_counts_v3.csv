@@ -1,0 +1,7 @@
+signal,count,pass_rate_pct
+signal_v3_A_core,8,0.02090628756598547
+signal_v3_B_tagged,8,0.02090628756598547
+signal_v3_D_loose_structure,8,0.02090628756598547
+signal_v3_E_first_rally,2,0.005226571891496367
+signal_v3_C_or_logic,1,0.0026132859457481837
+signal_v3_B_tagged_rsi_context,0,0.0

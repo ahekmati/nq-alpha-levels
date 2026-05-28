@@ -1,0 +1,2 @@
+rule_name,symbol,signal_time,position_ticket,opened_at_utc,expire_at_utc,status,mt5_comment
+early_short_proto_v1,MNQ,2026-05-16 06:00:00+00:00,,2026-05-16 18:10:09.604937+00:00,,no_signal,

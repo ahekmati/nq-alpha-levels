@@ -1,0 +1,2 @@
+initial_capital_usd,final_capital_usd,total_pnl_usd,total_return_pct,total_trades,winners,losers,win_rate_pct,profit_factor,sharpe,max_drawdown_usd,max_drawdown_pct,avg_winner_usd,avg_loser_usd,avg_pnl_per_trade_usd
+5000.0,7227.4285714285725,2227.4285714285725,44.54857142857145,90,44,46,48.888888888888886,1.3738237092269148,2.3108846327159127,-942.5357142857174,-18.85071428571435,186.04383116883128,-129.53260869565224,24.74920634920636

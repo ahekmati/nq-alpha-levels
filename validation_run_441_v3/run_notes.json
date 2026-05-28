@@ -1,0 +1,11 @@
+{
+  "hard_stop_points": 200.0,
+  "hard_stop_usd": 400.0,
+  "notes": [
+    "Hard stop distance capped at 200 points / $400 for MNQ",
+    "Cooldown of 48 H1 bars after 2 consecutive losing trades",
+    "Initial target arms trailing logic instead of forced exit",
+    "Optional costs/slippage included in neighbor variants",
+    "Walk-forward uses 3-year train / 12-month test rolling slices"
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "symbol_used": "@MNQ",
+  "start": "2020-01-01 00:00:00+00:00",
+  "end": "2026-05-20 10:19:55.020280+00:00",
+  "n_d1_bars": 2144,
+  "n_h1_bars": 38338,
+  "n_events": 4,
+  "event_positive_rate": 0.75,
+  "atr_threshold": 120.0,
+  "hmm_available": true
+}

@@ -1,0 +1,12 @@
+condition,passes,pass_rate_pct
+in_session,483,29.83323038912909
+soft_daily_weakening,877,54.1692402717727
+soft_slope_condition,192,11.8591723285979
+overbought_stall_condition,0,0.0
+upper_range_failure,30,1.8529956763434219
+close_back_below_ema20_fail,202,12.476837554045707
+near_end_of_avg_ob_streak,70,4.323656578134651
+early_relaxed_signal_A,0,0.0
+early_relaxed_signal_B,0,0.0
+early_relaxed_signal_C,0,0.0
+first_rally_short_relaxed,0,0.0

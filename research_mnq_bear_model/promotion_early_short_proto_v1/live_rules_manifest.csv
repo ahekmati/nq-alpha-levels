@@ -1,0 +1,2 @@
+rule_name,enabled,source_signal_column,description,entry_side,timeframe,session_filter,window_filter,structure_filter,context_filter,optional_context_tag,optional_rejection_tag,stop_points,time_exit_h,mode,r_mult_if_target_mode,notes
+early_short_proto_v1,1,signal_v3_A_core,Early upper-range failure in soft bear context promoted from v3 research.,short,H1,14:00-20:00 UTC,is_early_window == 1,upper_range_failure_v3 == 1,bear_context_soft_v3 == 1,rsi70_context_tag_v3,stall_or_reject_tag_v3,300.0,48,stop_time,2.0,"RSI>70 context retained as tag only, not hard gate."
