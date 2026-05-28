@@ -127,7 +127,7 @@ def get_front_month_symbol(prefix: str = "MNQ") -> str:
 SWING_LOOKBACK = 5
 LEVEL_ZONE_ATR = 0.30
 SL_ATR         = 1.0
-TP_R           = 2.0
+TP_ATR         = 2.0    # take profit = 2.0 * ATR14 above entry
 
 TIMEFRAME_MAP = {
     "M5": 5, "M15": 15, "H1": 16385,
@@ -619,6 +619,16 @@ def place_limit_order_mt5linux(symbol: str, level: float,
     sl_r    = round_tick(sl)
     tp_r    = round_tick(tp)
 
+    # Determine best filling mode for this symbol
+    sym_info = mt5.symbol_info(symbol)
+    filling  = mt5.ORDER_FILLING_RETURN
+    if sym_info is not None:
+        fm = getattr(sym_info, "filling_mode", 0)
+        if fm == getattr(mt5, "SYMBOL_FILLING_IOC", 2):
+            filling = mt5.ORDER_FILLING_IOC
+        elif fm == getattr(mt5, "SYMBOL_FILLING_FOK", 1):
+            filling = mt5.ORDER_FILLING_FOK
+
     request = {
         "action":        mt5.TRADE_ACTION_PENDING,
         "symbol":        symbol,
@@ -631,7 +641,7 @@ def place_limit_order_mt5linux(symbol: str, level: float,
         "magic":         AUTO_TRADE_MAGIC,
         "comment":       "nq_alpha_bot",
         "type_time":     mt5.ORDER_TIME_GTC,
-        "type_filling":  mt5.ORDER_FILLING_IOC,
+        "type_filling":  filling,
     }
 
     log.info(f"Placing limit order: {symbol} BUY LIMIT @ {price_r} "
@@ -645,7 +655,23 @@ def place_limit_order_mt5linux(symbol: str, level: float,
 
     if result.retcode != mt5.TRADE_RETCODE_DONE:
         log.error(f"Order failed | retcode={result.retcode} | "
-                  f"comment={getattr(result, 'comment', 'n/a')}")
+                  f"comment={getattr(result, 'comment', 'n/a')} | "
+                  f"last_error={mt5.last_error()}")
+        # Try with alternate filling modes
+        for alt_filling in [mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN]:
+            if alt_filling == filling:
+                continue
+            log.info(f"Retrying with filling mode {alt_filling}...")
+            request["type_filling"] = alt_filling
+            result = mt5.order_send(request)
+            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                log.info(f"Order succeeded with filling mode {alt_filling}")
+                break
+            log.warning(f"filling={alt_filling} failed: retcode={getattr(result,'retcode','?')} "
+                       f"comment={getattr(result,'comment','?')}")
+
+    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+        log.error(f"Order failed all filling modes | last retcode={getattr(result,'retcode','?')}")
         return -1
 
     ticket = result.order
@@ -700,7 +726,7 @@ def format_alert(strong_levels, watch_levels, trend_info,
         lines.append("🔥 <b>STRONG (75%+)</b>")
         for lv in strong_levels:
             sl  = lv["level"] - SL_ATR * atr_val
-            tp  = lv["level"] + TP_R * abs(lv["level"] - sl)
+            tp  = lv["level"] + TP_ATR * atr_val
             rsk = abs(lv["level"] - sl)
             ens = lv.get("ensemble")
             if ens:
@@ -725,7 +751,7 @@ def format_alert(strong_levels, watch_levels, trend_info,
             )
             lines.append(
                 f"     Risk: {rsk:.0f}pts (${rsk*2:.0f})  "
-                f"Target: {rsk*TP_R:.0f}pts (${rsk*TP_R*2:.0f})"
+                f"Target: {TP_ATR:.1f} ATR = {TP_ATR*atr_val:.0f}pts (${TP_ATR*atr_val*2:.0f})"
             )
         lines.append("")
 
@@ -733,7 +759,7 @@ def format_alert(strong_levels, watch_levels, trend_info,
         lines.append("👀 <b>WATCH (60–75%)</b>")
         for lv in watch_levels:
             sl  = lv["level"] - SL_ATR * atr_val
-            tp  = lv["level"] + TP_R * abs(lv["level"] - sl)
+            tp  = lv["level"] + TP_ATR * atr_val
             ens = lv.get("ensemble")
             if ens:
                 n_a = ens["n_agree"]
@@ -920,7 +946,7 @@ def main():
         # ── Log signals to history ────────────────────────────────────────────
         for lv in strong_levels + watch_levels:
             sl = lv["level"] - SL_ATR * atr_val
-            tp = lv["level"] + TP_R * abs(lv["level"] - sl)
+            tp = lv["level"] + TP_ATR * atr_val
             log_signal(
                 level_price  = lv["price"],
                 score        = lv["score"],
@@ -972,7 +998,7 @@ def main():
                     )
                 else:
                     sl     = best["level"] - SL_ATR * atr_val
-                    tp     = best["level"] + TP_R * abs(best["level"] - sl)
+                    tp     = best["level"] + TP_ATR * atr_val
                     risk   = abs(best["level"] - sl)
 
                     ticket = place_limit_order_mt5linux(
@@ -998,7 +1024,7 @@ def main():
                             f"   Ticket: #{ticket}\n"
                             f"   Entry : {best['level']:,.2f}\n"
                             f"   SL    : {sl:,.2f}  ({risk:.0f}pts / ${risk*2:.0f})\n"
-                            f"   TP    : {tp:,.2f}  ({risk*TP_R:.0f}pts / ${risk*TP_R*2:.0f})\n"
+                            f"   TP    : {tp:,.2f}  ({TP_ATR:.1f} ATR = {TP_ATR*atr_val:.0f}pts / ${TP_ATR*atr_val*2:.0f})\n"
                             f"   Status: Waiting for fill (expires in 3 bars)"
                         )
                         send_telegram(order_msg)
@@ -1080,7 +1106,7 @@ def show_history(n=10):
     losses   = sum(1 for s in history if s.get("outcome") == "loss")
     pending  = sum(1 for s in history if s.get("outcome") is None)
     total_r  = sum(
-        (TP_R if s.get("outcome") == "win" else -1.0)
+        (2.0 if s.get("outcome") == "win" else -1.0)
         for s in history if s.get("outcome") in ("win", "loss")
     )
     resolved = wins + losses
@@ -1129,8 +1155,8 @@ if __name__ == "__main__":
             else:
                 price  = tick.bid
                 entry  = round(price - 50, 2)   # 50 pts below current price
-                sl     = round(entry - 100, 2)   # 100 pts stop
-                tp     = round(entry + 200, 2)   # 200 pts target (2R)
+                sl     = round(entry - 100, 2)   # 100 pts stop (~1 ATR)
+                tp     = round(entry + 220, 2)   # ~2 ATR target (110*2)
                 print(f"TEST ORDER: {symbol} BUY LIMIT @ {entry}  SL={sl}  TP={tp}")
                 print(f"Current price: {price}")
                 ticket = place_limit_order_mt5linux(symbol, entry, sl, tp)

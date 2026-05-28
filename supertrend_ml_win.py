@@ -520,25 +520,47 @@ def send_market_order(mt5: MetaTrader5, symbol: str, direction: int,
 
     order_type = mt5.ORDER_TYPE_BUY if direction == 1 else mt5.ORDER_TYPE_SELL
 
+    # Determine best filling mode for this symbol
+    filling = mt5.ORDER_FILLING_RETURN
+    sym_fm  = getattr(info, "filling_mode", 0)
+    if sym_fm == getattr(mt5, "SYMBOL_FILLING_IOC", 2):
+        filling = mt5.ORDER_FILLING_IOC
+    elif sym_fm == getattr(mt5, "SYMBOL_FILLING_FOK", 1):
+        filling = mt5.ORDER_FILLING_FOK
+
     request = {
-        "action":     mt5.TRADE_ACTION_DEAL,
-        "symbol":     symbol,
-        "volume":     float(lot),
-        "type":       order_type,
-        "price":      price,
-        "sl":         sl_clean,
-        "tp":         tp_clean,
-        "deviation":  20,
-        "magic":      magic,
-        "comment":    comment,
-        "type_time":  mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
+        "action":       mt5.TRADE_ACTION_DEAL,
+        "symbol":       symbol,
+        "volume":       float(lot),
+        "type":         order_type,
+        "price":        price,
+        "sl":           sl_clean,
+        "tp":           tp_clean,
+        "deviation":    20,
+        "magic":        magic,
+        "comment":      comment,
+        "type_time":    mt5.ORDER_TIME_GTC,
+        "type_filling": filling,
     }
 
     dbg(f"Order request: price={price} sl={sl_clean} tp={tp_clean} "
-        f"deviation=20 filling=IOC")
+        f"deviation=20 filling={filling}")
 
     result = mt5.order_send(request)
+
+    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+        # Retry with alternate filling modes
+        for alt_filling in [mt5.ORDER_FILLING_IOC,
+                            mt5.ORDER_FILLING_FOK,
+                            mt5.ORDER_FILLING_RETURN]:
+            if alt_filling == filling:
+                continue
+            dbg(f"Retrying with filling mode {alt_filling}...")
+            request["type_filling"] = alt_filling
+            result = mt5.order_send(request)
+            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                dbg(f"Order succeeded with filling mode {alt_filling}")
+                break
 
     if result is None:
         err_msg = f"order_send returned None: {mt5.last_error()}"
