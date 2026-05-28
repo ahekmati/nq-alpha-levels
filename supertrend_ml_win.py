@@ -272,7 +272,8 @@ def tg_error(context: str, error: str) -> None:
 # =============================================================================
 # USER CONFIG
 # =============================================================================
-SYMBOL = "@MNQ"
+SYMBOL       = "@MNQ"   # continuous contract — used for data fetching only
+SYMBOL_ROOT  = "MNQ"    # root used to resolve front month for live trading
 DAILY_TF_MIN = 1440
 H1_TF_MIN    = 60
 
@@ -355,6 +356,39 @@ MODEL_MAX_AGE_H  = 24    # hours before model is considered stale and retrains
 # =============================================================================
 # MT5 HELPERS
 # =============================================================================
+
+def get_live_symbol(mt5: MetaTrader5, root: str = SYMBOL_ROOT) -> str:
+    """
+    Resolve the active front month contract for live order placement
+    and position checking. Uses highest open interest / volume among
+    all contracts matching the root prefix.
+    Falls back to @MNQ if detection fails.
+    """
+    try:
+        symbols = mt5.symbols_get(f"{root}*")
+        if not symbols:
+            dbg(f"No symbols found for {root}* — falling back to @{root}")
+            return f"@{root}"
+        candidates = []
+        for s in symbols:
+            name = s.name
+            # Skip continuous contracts and non-standard names
+            if name.startswith("@") or len(name) > 8:
+                continue
+            tick = mt5.symbol_info_tick(name)
+            vol  = getattr(tick, "volume", 0) or 0
+            candidates.append((vol, name))
+        if not candidates:
+            dbg(f"No front month candidates found — falling back to @{root}")
+            return f"@{root}"
+        candidates.sort(reverse=True)
+        front = candidates[0][1]
+        dbg(f"Front month resolved: {front} (vol={candidates[0][0]})")
+        return front
+    except Exception as e:
+        dbg(f"get_live_symbol error: {e} — falling back to @{root}")
+        return f"@{root}"
+
 
 def initialize_mt5() -> MetaTrader5:
     dbg("Initializing MT5 connection...")
@@ -1772,18 +1806,22 @@ def run_live(full_df: pd.DataFrame, best_params: dict,
     status("Signal confirmed — connecting MT5 for position check...")
     mt5 = initialize_mt5()
     try:
+        # Resolve front month for position check and order placement
+        live_symbol = get_live_symbol(mt5, SYMBOL_ROOT)
+        dbg(f"Live trading symbol: {live_symbol}")
+
         # PRIMARY GUARD: check for any open position on this symbol
-        if has_open_position(mt5, SYMBOL, LIVE_MAGIC):
+        if has_open_position(mt5, live_symbol, LIVE_MAGIC):
             status("BLOCKED — open position already exists. "
                    "No order sent. Will check again next bar.")
-            positions = mt5.positions_get(symbol=SYMBOL) or []
+            positions = mt5.positions_get(symbol=live_symbol) or []
             tg_blocked_position(list(positions))
             return
 
         # ── GATE 4: Spread check ───────────────────────────────────
-        if not check_spread(mt5, SYMBOL, LIVE_MAX_SPREAD_PTS):
+        if not check_spread(mt5, live_symbol, LIVE_MAX_SPREAD_PTS):
             status("BLOCKED — spread too wide. No order sent.")
-            tg(f"⚠️ <b>ST-ML BLOCKED</b> — spread too wide on {SYMBOL}. "
+            tg(f"⚠️ <b>ST-ML BLOCKED</b> — spread too wide on {live_symbol}. "
                f"No order sent.")
             return
 
@@ -1792,12 +1830,12 @@ def run_live(full_df: pd.DataFrame, best_params: dict,
         sl        = sig["sl_estimate"]
         tp        = sig["tp_estimate"] if sig["tp_estimate"] else float("nan")
 
-        status(f"SENDING ORDER: {sig['direction']} {LIVE_LOT_SIZE} {SYMBOL} "
+        status(f"SENDING ORDER: {sig['direction']} {LIVE_LOT_SIZE} {live_symbol} "
                f"SL={sl:.2f} TP={tp if not np.isnan(tp) else 'TRAIL'}")
 
         order_result = send_market_order(
             mt5       = mt5,
-            symbol    = SYMBOL,
+            symbol    = live_symbol,
             direction = direction,
             lot       = LIVE_LOT_SIZE,
             sl        = sl,
