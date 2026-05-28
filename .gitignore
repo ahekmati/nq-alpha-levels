@@ -23,7 +23,7 @@ Thumbs.db
 logs/
 *.log
 *.txt
-
+!requirements.txt
 # All data and output files
 *.csv
 *.json
@@ -53,3 +53,5 @@ validation_run_441_v3/
 validation_run_441_v4/
 validation_variant8_deepcheck/
 logs/
+
+
