@@ -1,2 +1,0 @@
-signal_time,entry_time,exit_time,entry_price,exit_price,stop_price,target_price,stop_points,tp_points,r_mult,exit_reason,gross_points,gross_dollars,net_dollars,bars_held
-2026-01-30T14:00:00+00:00,2026-01-30T15:00:00+00:00,2026-04-15T19:00:00+00:00,26063.0,26365.0,26363.0,0.0,300.0,0.0,2.0,stop,-302.0,-604.0,-605.5,1213

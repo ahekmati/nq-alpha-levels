@@ -1,2 +1,0 @@
-symbol,timeframe,hammer_spec,entry_mode,stop_mode,target_mode,trades,win_rate,gross_profit,gross_loss,profit_factor,avg_trade,avg_win,avg_loss,expectancy_r,avg_mfe_points,avg_mae_points,max_drawdown,final_capital,net_profit,sharpe_like
-@MNQ,H1,standard,next_open,hammer_low_buffer,r_multiple,928,0.4418103448275862,52286.17999999999,50946.0,1.0263058925136417,1.444159482758617,127.5272682926829,-98.35135135135135,0.014280661736571295,53.64168103448275,-53.196605603448276,-5313.75,6340.179999999997,1340.1799999999967,0.009218565316156304
