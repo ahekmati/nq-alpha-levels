@@ -210,6 +210,9 @@ def tg_ml_filtered(sig: dict) -> None:
 
 def tg_order_sent(sig: dict, order_result: dict) -> None:
     """Alert when an order is successfully filled."""
+    tp_val  = order_result.get('tp', 0)
+    atr14   = sig.get('atr14', 0)
+    tp_str  = f"{tp_val:.2f} (2 ATR = {2.0*atr14:.0f} pts)" if tp_val else 'NONE'
     tg(
         f"✅ <b>ST-ML ORDER FILLED</b>\n"
         f"Direction: {sig['direction']}\n"
@@ -218,9 +221,10 @@ def tg_order_sent(sig: dict, order_result: dict) -> None:
         f"Fill price: {order_result.get('price', 0):.2f}\n"
         f"Volume: {order_result.get('volume', 0)}\n"
         f"SL: {order_result.get('sl', 0):.2f}\n"
-        f"TP: {order_result.get('tp', 0):.2f if order_result.get('tp') else 'TRAIL'}\n"
+        f"TP: {tp_str}\n"
         f"ML proba: {sig.get('consensus_proba', 0):.4f}\n"
-        f"Est net USD: ${sig.get('consensus_net_usd', 0):.0f}"
+        f"Est net USD: ${sig.get('consensus_net_usd', 0):.0f}\n"
+        f"💡 Modify TP in MT5 to let it run further"
     )
 
 
@@ -1850,10 +1854,18 @@ def run_live(full_df: pd.DataFrame, best_params: dict,
         # ── EXECUTE ────────────────────────────────────────────────
         direction = 1 if sig["direction"] == "LONG" else -1
         sl        = sig["sl_estimate"]
-        tp        = sig["tp_estimate"] if sig["tp_estimate"] else float("nan")
+        atr14     = sig["atr14"]
+
+        # Fixed 2 ATR take profit — overrides trailing_st from backtest params.
+        # Trailing ST exit cannot be automated live (no hourly SL update).
+        # 2 ATR TP gives a clean 2:1 RR and closes automatically.
+        # You can modify or remove the TP manually in MT5 after fill if you
+        # want to let a strong trade run further.
+        entry_est = sig["entry_estimate"]
+        tp = round(entry_est + direction * 2.0 * atr14, 2)
 
         status(f"SENDING ORDER: {sig['direction']} {LIVE_LOT_SIZE} {live_symbol} "
-               f"SL={sl:.2f} TP={tp if not np.isnan(tp) else 'TRAIL'}")
+               f"SL={sl:.2f} TP={tp:.2f} (2 ATR = {2.0*atr14:.0f} pts)")
 
         order_result = send_market_order(
             mt5       = mt5,
