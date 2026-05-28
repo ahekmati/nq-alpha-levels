@@ -303,6 +303,18 @@ MIN_TRAIN_TRADES          = 25
 CONSENSUS_PROBA_THRESHOLD = 0.60
 QUALITY_USD_THRESHOLD     = 15.0
 SLIPPAGE_POINTS           = 0.50
+
+# =============================================================================
+# LIVE RSI BAND OVERRIDE
+# =============================================================================
+# Forces a specific RSI band in live signal checks regardless of what the
+# walk-forward model selected. Set to None to use the model's chosen band.
+# Based on OOS zone analysis: (55,65) outperforms (50,60) across all metrics:
+#   60-65 zone: 67.7% WR, $205 exp, PF=3.58 (best zone, flagged ◀ strong)
+#   55-60 zone: 61.5% WR, $177 exp, PF=3.39
+# Setting (55,65) captures both zones and matches recent model selections.
+# =============================================================================
+LIVE_RSI_BAND_OVERRIDE = (55, 65)   # set to None to use model's band
 COMMISSION_PER_SIDE_USD   = 0.82
 MNQ_DOLLARS_PER_POINT     = 2.0
 
@@ -1673,7 +1685,15 @@ def scan_live_signal(full_df: pd.DataFrame, best_params: dict,
     st_period = int(best_params["st_period"])
     st_mult_v = float(best_params["st_mult"])
     direction = int(best_params["direction"])
-    rsi_band  = (best_params["rsi_lo"], best_params["rsi_hi"])
+
+    # Apply live RSI band override if set, otherwise use model's chosen band
+    if LIVE_RSI_BAND_OVERRIDE is not None:
+        rsi_band = LIVE_RSI_BAND_OVERRIDE
+        dbg(f"RSI band override active: {rsi_band} "
+            f"(model selected ({best_params['rsi_lo']},{best_params['rsi_hi']}))")
+    else:
+        rsi_band = (best_params["rsi_lo"], best_params["rsi_hi"])
+
     st_col    = f"st_{st_period}_{st_mult_v}"
     flip_col  = (f"flip_up_{st_col}" if direction == 1
                  else f"flip_dn_{st_col}")
