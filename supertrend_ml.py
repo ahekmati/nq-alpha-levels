@@ -276,10 +276,23 @@ MNQ_DOLLARS_PER_POINT     = 2.0
 
 # Live execution config
 LIVE_LOT_SIZE        = 1          # number of MNQ contracts
-LIVE_MAGIC           = 20240101   # unique EA magic number — change if running multiple EAs
+LIVE_MAGIC           = 20240101   # unique EA magic number
 LIVE_ORDER_COMMENT   = "ST_ML_v2"
 LIVE_MAX_SPREAD_PTS  = 5.0        # refuse to trade if spread > this many points
 LAST_N_TRADES        = 5          # how many recent historical trades to replay/print
+
+# =============================================================================
+# SESSION GATE CONFIG
+# =============================================================================
+# Only trade during proven high-probability sessions (UTC hours).
+# Based on OOS feature importance: is_us_core + is_london both top predictors.
+# London open (08:00) through US close (21:00) covers ~90% of MNQ edge.
+# Set ENFORCE_SESSION_GATE = False to trade any hour (e.g. manual override).
+# Use --force-session flag on command line to bypass for a single run.
+# =============================================================================
+ENFORCE_SESSION_GATE = True
+SESSION_START_UTC    = 8     # 08:00 UTC = London open (3am ET)
+SESSION_END_UTC      = 21    # 21:00 UTC = 5pm ET (after US close)
 
 # =============================================================================
 # TELEGRAM CONFIG
@@ -1648,16 +1661,46 @@ def scan_live_signal(full_df: pd.DataFrame, best_params: dict,
 
 
 # =============================================================================
+# SESSION GATE
+# =============================================================================
+
+def is_in_session(force: bool = False) -> bool:
+    """
+    Returns True if current UTC hour is within the trading session window.
+    London open (08:00) through US close (21:00) UTC.
+    force=True bypasses the check for manual override runs.
+    """
+    if not ENFORCE_SESSION_GATE or force:
+        dbg("Session gate bypassed")
+        return True
+    now_hour = datetime.now(timezone.utc).hour
+    in_session = SESSION_START_UTC <= now_hour < SESSION_END_UTC
+    dbg(f"Session gate: UTC hour={now_hour} "
+        f"window={SESSION_START_UTC}:00-{SESSION_END_UTC}:00 "
+        f"in_session={in_session}")
+    return in_session
+
+
+# =============================================================================
 # LIVE EXECUTION ENGINE
 # =============================================================================
 
 def run_live(full_df: pd.DataFrame, best_params: dict,
-             result: dict | None) -> None:
+             result: dict | None, force_session: bool = False) -> None:
     """
     Live mode: check signal, guard against open positions, send order.
     This is the production execution function.
     """
     status("LIVE MODE — checking for trade signal")
+
+    # ── GATE 0: Session gate ───────────────────────────────────────
+    if not is_in_session(force=force_session):
+        now_hour = datetime.now(timezone.utc).hour
+        status(f"OUTSIDE SESSION HOURS — UTC hour={now_hour} "
+               f"(window={SESSION_START_UTC}:00-{SESSION_END_UTC}:00). "
+               f"No order sent. Use --force-session to override.")
+        dbg("Use --force-session flag to trade outside session hours")
+        return
 
     sig = scan_live_signal(full_df, best_params, result)
 
@@ -1876,6 +1919,9 @@ def main() -> None:
     parser.add_argument(
         "--no-debug", action="store_true",
         help="Suppress debug prints")
+    parser.add_argument(
+        "--force-session", action="store_true",
+        help="Bypass session gate — trade outside normal hours (use carefully)")
     args = parser.parse_args()
 
     global DEBUG
@@ -1954,7 +2000,8 @@ def main() -> None:
 
         # Print last N trades and execute
         print_last_n_trades(full, best_params, final_result, LAST_N_TRADES)
-        run_live(full, best_params, final_result)
+        run_live(full, best_params, final_result,
+                 force_session=args.force_session)
         return
 
     # ── RESEARCH MODE: full walk-forward ────────────────────────────
