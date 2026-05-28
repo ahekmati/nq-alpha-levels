@@ -67,6 +67,13 @@ ORDER_STATE_PATH    = "logs/order_state.json"
 # ── Windows native MT5 ───────────────────────────────────────────────────────
 import MetaTrader5 as mt5
 
+# ── Windows console UTF-8 fix ─────────────────────────────────────────────────
+import sys, io
+if sys.stdout.encoding != "utf-8":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+if sys.stderr.encoding != "utf-8":
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -79,7 +86,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(SCAN_LOG_PATH),
+        logging.FileHandler(SCAN_LOG_PATH, encoding="utf-8"),
     ]
 )
 log = logging.getLogger("levels_alert")
