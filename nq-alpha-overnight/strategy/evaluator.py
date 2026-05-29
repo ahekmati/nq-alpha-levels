@@ -30,6 +30,7 @@ Run via Windows Task Scheduler at 16:05 ET daily.
 
 import json
 import logging
+import ssl
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -151,7 +152,10 @@ def send_telegram(message: str) -> bool:
             "parse_mode" : "HTML",
         }).encode("utf-8")
         url     = f"https://api.telegram.org/bot{token}/sendMessage"
-        req     = urlopen(url, data=params, timeout=10)
+        ctx     = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode    = ssl.CERT_NONE
+        req     = urlopen(url, data=params, timeout=10, context=ctx)
         resp    = json.loads(req.read().decode("utf-8"))
         if resp.get("ok"):
             log.info("Telegram alert sent.")
