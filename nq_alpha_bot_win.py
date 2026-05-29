@@ -67,13 +67,6 @@ ORDER_STATE_PATH    = "logs/order_state.json"
 # ── Windows native MT5 ───────────────────────────────────────────────────────
 import MetaTrader5 as mt5
 
-# ── Windows console UTF-8 fix ─────────────────────────────────────────────────
-import sys, io
-if sys.stdout.encoding != "utf-8":
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-if sys.stderr.encoding != "utf-8":
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
-
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -86,7 +79,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(SCAN_LOG_PATH, encoding="utf-8"),
+        logging.FileHandler(SCAN_LOG_PATH),
     ]
 )
 log = logging.getLogger("levels_alert")
@@ -127,7 +120,7 @@ def get_front_month_symbol(prefix: str = "MNQ") -> str:
 SWING_LOOKBACK = 5
 LEVEL_ZONE_ATR = 0.30
 SL_ATR         = 1.0
-TP_ATR         = 2.0    # take profit = 2.0 * ATR14 above entry
+TP_R           = 2.0
 
 TIMEFRAME_MAP = {
     "M5": 5, "M15": 15, "H1": 16385,
@@ -619,16 +612,6 @@ def place_limit_order_mt5linux(symbol: str, level: float,
     sl_r    = round_tick(sl)
     tp_r    = round_tick(tp)
 
-    # Determine best filling mode for this symbol
-    sym_info = mt5.symbol_info(symbol)
-    filling  = mt5.ORDER_FILLING_RETURN
-    if sym_info is not None:
-        fm = getattr(sym_info, "filling_mode", 0)
-        if fm == getattr(mt5, "SYMBOL_FILLING_IOC", 2):
-            filling = mt5.ORDER_FILLING_IOC
-        elif fm == getattr(mt5, "SYMBOL_FILLING_FOK", 1):
-            filling = mt5.ORDER_FILLING_FOK
-
     request = {
         "action":        mt5.TRADE_ACTION_PENDING,
         "symbol":        symbol,
@@ -641,7 +624,7 @@ def place_limit_order_mt5linux(symbol: str, level: float,
         "magic":         AUTO_TRADE_MAGIC,
         "comment":       "nq_alpha_bot",
         "type_time":     mt5.ORDER_TIME_GTC,
-        "type_filling":  filling,
+        "type_filling":  mt5.ORDER_FILLING_IOC,
     }
 
     log.info(f"Placing limit order: {symbol} BUY LIMIT @ {price_r} "
@@ -655,23 +638,7 @@ def place_limit_order_mt5linux(symbol: str, level: float,
 
     if result.retcode != mt5.TRADE_RETCODE_DONE:
         log.error(f"Order failed | retcode={result.retcode} | "
-                  f"comment={getattr(result, 'comment', 'n/a')} | "
-                  f"last_error={mt5.last_error()}")
-        # Try with alternate filling modes
-        for alt_filling in [mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN]:
-            if alt_filling == filling:
-                continue
-            log.info(f"Retrying with filling mode {alt_filling}...")
-            request["type_filling"] = alt_filling
-            result = mt5.order_send(request)
-            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                log.info(f"Order succeeded with filling mode {alt_filling}")
-                break
-            log.warning(f"filling={alt_filling} failed: retcode={getattr(result,'retcode','?')} "
-                       f"comment={getattr(result,'comment','?')}")
-
-    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-        log.error(f"Order failed all filling modes | last retcode={getattr(result,'retcode','?')}")
+                  f"comment={getattr(result, 'comment', 'n/a')}")
         return -1
 
     ticket = result.order
@@ -725,9 +692,9 @@ def format_alert(strong_levels, watch_levels, trend_info,
     if strong_levels:
         lines.append("🔥 <b>STRONG (75%+)</b>")
         for lv in strong_levels:
-            sl  = lv["level"] - SL_ATR * atr_val
-            tp  = lv["level"] + TP_ATR * atr_val
-            rsk = abs(lv["level"] - sl)
+            sl  = lv["price"] - SL_ATR * atr_val
+            tp  = lv["price"] + TP_R * abs(lv["price"] - sl)
+            rsk = abs(lv["price"] - sl)
             ens = lv.get("ensemble")
             if ens:
                 n_a = ens["n_agree"]
@@ -751,15 +718,15 @@ def format_alert(strong_levels, watch_levels, trend_info,
             )
             lines.append(
                 f"     Risk: {rsk:.0f}pts (${rsk*2:.0f})  "
-                f"Target: {TP_ATR:.1f} ATR = {TP_ATR*atr_val:.0f}pts (${TP_ATR*atr_val*2:.0f})"
+                f"Target: {rsk*TP_R:.0f}pts (${rsk*TP_R*2:.0f})"
             )
         lines.append("")
 
     if watch_levels:
         lines.append("👀 <b>WATCH (60–75%)</b>")
         for lv in watch_levels:
-            sl  = lv["level"] - SL_ATR * atr_val
-            tp  = lv["level"] + TP_ATR * atr_val
+            sl  = lv["price"] - SL_ATR * atr_val
+            tp  = lv["price"] + TP_R * abs(lv["price"] - sl)
             ens = lv.get("ensemble")
             if ens:
                 n_a = ens["n_agree"]
@@ -945,8 +912,8 @@ def main():
 
         # ── Log signals to history ────────────────────────────────────────────
         for lv in strong_levels + watch_levels:
-            sl = lv["level"] - SL_ATR * atr_val
-            tp = lv["level"] + TP_ATR * atr_val
+            sl = lv["price"] - SL_ATR * atr_val
+            tp = lv["price"] + TP_R * abs(lv["price"] - sl)
             log_signal(
                 level_price  = lv["price"],
                 score        = lv["score"],
@@ -997,13 +964,13 @@ def main():
                         f"Level {best['level']:,.2f} — check manually"
                     )
                 else:
-                    sl     = best["level"] - SL_ATR * atr_val
-                    tp     = best["level"] + TP_ATR * atr_val
-                    risk   = abs(best["level"] - sl)
+                    sl     = best["price"] - SL_ATR * atr_val
+                    tp     = best["price"] + TP_R * abs(best["price"] - sl)
+                    risk   = abs(best["price"] - sl)
 
                     ticket = place_limit_order_mt5linux(
                         symbol = symbol,
-                        level  = best["level"],
+                        level  = best["price"],
                         sl     = sl,
                         tp     = tp,
                     )
@@ -1013,7 +980,7 @@ def main():
                         save_order_state({
                             "pending_ticket":    ticket,
                             "placed_at":         datetime.now(timezone.utc).isoformat(),
-                            "level":             best["level"],
+                            "level":             best["price"],
                             "sl":                sl,
                             "tp":                tp,
                             "bars_since_placed": 0,
@@ -1024,7 +991,7 @@ def main():
                             f"   Ticket: #{ticket}\n"
                             f"   Entry : {best['level']:,.2f}\n"
                             f"   SL    : {sl:,.2f}  ({risk:.0f}pts / ${risk*2:.0f})\n"
-                            f"   TP    : {tp:,.2f}  ({TP_ATR:.1f} ATR = {TP_ATR*atr_val:.0f}pts / ${TP_ATR*atr_val*2:.0f})\n"
+                            f"   TP    : {tp:,.2f}  ({risk*TP_R:.0f}pts / ${risk*TP_R*2:.0f})\n"
                             f"   Status: Waiting for fill (expires in 3 bars)"
                         )
                         send_telegram(order_msg)
@@ -1106,7 +1073,7 @@ def show_history(n=10):
     losses   = sum(1 for s in history if s.get("outcome") == "loss")
     pending  = sum(1 for s in history if s.get("outcome") is None)
     total_r  = sum(
-        (2.0 if s.get("outcome") == "win" else -1.0)
+        (TP_R if s.get("outcome") == "win" else -1.0)
         for s in history if s.get("outcome") in ("win", "loss")
     )
     resolved = wins + losses
@@ -1132,8 +1099,6 @@ if __name__ == "__main__":
                         help="Show last N signals from history: --history 10")
     parser.add_argument("--test", action="store_true",
                         help="Test Telegram connection only")
-    parser.add_argument("--test-order", action="store_true",
-                        help="Place a real test limit order 50pts below current price to verify MT5 order flow. Cancel manually after.")
     args = parser.parse_args()
 
     if args.test:
@@ -1142,38 +1107,6 @@ if __name__ == "__main__":
                f"Telegram connection working!")
         success = send_telegram(msg)
         print("Telegram test:", "OK" if success else "FAILED")
-
-    elif args.test_order:
-        import MetaTrader5 as mt5
-        if not mt5.initialize():
-            print(f"MT5 connect failed: {mt5.last_error()}")
-        else:
-            symbol = get_front_month_symbol(SYMBOL_PREFIX)
-            tick   = mt5.symbol_info_tick(symbol)
-            if tick is None:
-                print(f"Could not get tick for {symbol}")
-            else:
-                price  = tick.bid
-                entry  = round(price - 50, 2)   # 50 pts below current price
-                sl     = round(entry - 100, 2)   # 100 pts stop (~1 ATR)
-                tp     = round(entry + 220, 2)   # ~2 ATR target (110*2)
-                print(f"TEST ORDER: {symbol} BUY LIMIT @ {entry}  SL={sl}  TP={tp}")
-                print(f"Current price: {price}")
-                ticket = place_limit_order_mt5linux(symbol, entry, sl, tp)
-                if ticket > 0:
-                    print(f"✅ Test order placed — ticket #{ticket}")
-                    print(f"Check MT5 terminal — cancel it manually when done")
-                    send_telegram(
-                        f"🧪 <b>TEST ORDER PLACED</b>\n"
-                        f"Symbol: {symbol}\n"
-                        f"BUY LIMIT @ {entry}\n"
-                        f"SL={sl}  TP={tp}\n"
-                        f"Ticket: #{ticket}\n"
-                        f"⚠️ Cancel manually after verifying"
-                    )
-                else:
-                    print("❌ Test order failed — check logs")
-            mt5.shutdown()
 
     elif args.update:
         level_price = float(args.update[0])
