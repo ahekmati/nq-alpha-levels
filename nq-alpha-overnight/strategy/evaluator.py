@@ -33,6 +33,9 @@ import logging
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.request import urlopen
+from urllib.parse import urlencode
+from urllib.error import URLError
 from zoneinfo import ZoneInfo       # Python 3.9+ (Windows 10+)
 
 import numpy as np
@@ -80,6 +83,15 @@ S2_RR              = 2.5
 
 ATR_PERIOD         = 14
 
+# ── Telegram config ───────────────────────────────────────────
+# Create telegram_config.json in the repo root (gitignored):
+# {
+#   "bot_token": "YOUR_BOT_TOKEN",
+#   "chat_id":   "YOUR_CHAT_ID"
+# }
+TELEGRAM_CONFIG = _ROOT / "telegram_config.json"
+
+
 # ─────────────────────────────────────────────
 # LOGGING
 # ─────────────────────────────────────────────
@@ -93,6 +105,66 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────
+# TELEGRAM ALERTS
+# ─────────────────────────────────────────────
+
+def load_telegram_config() -> tuple:
+    """
+    Load bot_token and chat_id from telegram_config.json.
+    Returns (token, chat_id) or (None, None) if file missing or invalid.
+    Never raises — Telegram failure must not block the strategy.
+    """
+    if not TELEGRAM_CONFIG.exists():
+        return None, None
+    try:
+        with open(TELEGRAM_CONFIG, encoding="utf-8") as f:
+            cfg = json.load(f)
+        token   = cfg.get("bot_token", "").strip()
+        chat_id = cfg.get("chat_id", "").strip()
+        if not token or not chat_id:
+            log.warning("Telegram config missing bot_token or chat_id.")
+            return None, None
+        return token, chat_id
+    except Exception as e:
+        log.warning(f"Telegram config load error: {e}")
+        return None, None
+
+
+def send_telegram(message: str) -> bool:
+    """
+    Send a message via Telegram Bot API using only stdlib urllib.
+    Returns True if sent successfully.
+    Never raises — failure is logged as warning only.
+    """
+    token, chat_id = load_telegram_config()
+    if token is None:
+        log.debug("Telegram not configured — skipping alert.")
+        return False
+
+    try:
+        params  = urlencode({
+            "chat_id"    : chat_id,
+            "text"       : message,
+            "parse_mode" : "HTML",
+        }).encode("utf-8")
+        url     = f"https://api.telegram.org/bot{token}/sendMessage"
+        req     = urlopen(url, data=params, timeout=10)
+        resp    = json.loads(req.read().decode("utf-8"))
+        if resp.get("ok"):
+            log.info("Telegram alert sent.")
+            return True
+        else:
+            log.warning(f"Telegram API error: {resp}")
+            return False
+    except URLError as e:
+        log.warning(f"Telegram network error: {e}")
+        return False
+    except Exception as e:
+        log.warning(f"Telegram send failed: {e}")
+        return False
 
 
 # ─────────────────────────────────────────────
@@ -512,7 +584,37 @@ def main():
     log.info(f"  Study 1: {'✅ ARMED' if s1['armed'] else '— not armed'}")
     log.info(f"  Study 2: {'✅ ARMED' if s2['armed'] else '— not armed'}")
 
-    if not any_armed:
+    # ── Telegram alert ────────────────────────────────────────
+    if any_armed:
+        lines = [f"🎯 <b>NQ Alpha Overnight — {today}</b>"]
+
+        if s1["armed"]:
+            lines.append(
+                f"\n📗 <b>Study 1 ARMED</b> (Trend Day Dip)\n"
+                f"  Entry : {s1['entry_price']}\n"
+                f"  Stop  : {s1['stop_price']}\n"
+                f"  Target: {s1['target_price']}\n"
+                f"  Risk  : {s1['risk_pts']} pts  |  RR {s1['rr']}:1\n"
+                f"  RSI={s1.get('daily_rsi','?')}  "
+                f"Gain={s1.get('gain_pct','?')}%  "
+                f"ATR={s1.get('atr_val','?')}"
+            )
+
+        if s2["armed"]:
+            lines.append(
+                f"\n📘 <b>Study 2 ARMED</b> (Rally Reversal)\n"
+                f"  Entry : {s2['entry_price']}\n"
+                f"  Stop  : {s2['stop_price']}\n"
+                f"  Target: {s2['target_price']}\n"
+                f"  Risk  : {s2['risk_pts']} pts  |  RR {s2['rr']}:1\n"
+                f"  Rally={s2.get('rally_mult','?')}x ATR  "
+                f"Selloff={s2.get('selloff_pct','?')}%  "
+                f"ATR={s2.get('atr_val','?')}"
+            )
+
+        lines.append("\n⏳ Watcher monitoring overnight...")
+        send_telegram("\n".join(lines))
+    else:
         log.info("No setups armed tonight — watcher will monitor but not trade.")
 
     mt5.shutdown()
