@@ -86,8 +86,8 @@ SWING_LOOKBACK = 5       # bars each side to confirm a swing low
 LEVEL_ZONE_ATR = 0.30    # level zone half-width as ATR multiple
 
 # ── ORDER SIZING ──────────────────────────────────────────────────────────────
-SL_ATR = 1.0             # stop loss distance as ATR multiple
-TP_R   = 2.0             # take profit as R multiple
+SL_ATR = 1.5             # stop loss distance as ATR multiple
+TP_R   = 3.0             # take profit as R multiple
 
 # ── HTF PROXIMITY THRESHOLDS (must match levels_ml_win.py) ───────────────────
 HTF_CONFLUENCE_THRESH     = 0.75   # ATR multiples for support stack count
