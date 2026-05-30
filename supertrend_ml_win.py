@@ -51,11 +51,11 @@
 # GOING LIVE:
 #   Run in two modes:
 #   MODE 1 — RESEARCH (default): full walk-forward train + OOS validation
-#   MODE 2 — LIVE:  python supertrend_ml.py --live
+#   MODE 2 — LIVE:  python supertrend_ml_win.py --live
 #     • Fetches latest bars, rebuilds features, checks signal on last bar
 #     • If signal fires AND ML confirms AND no open position → sends order
 #     • Saves state to mnq_live_state.json for monitoring
-#     • Run via cron every hour: 0 * * * * cd ~/projects/mt5-python && .venv/bin/python supertrend_ml.py --live
+#     • Run via Task Scheduler every hour
 # =============================================================================
 
 from __future__ import annotations
@@ -79,19 +79,28 @@ from numba import njit
 # ── Windows native MT5 ───────────────────────────────────────────────────────
 import MetaTrader5 as _mt5_module
 import sys, io
-if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
+# Guard stdout/stderr re-wrap — Task Scheduler / redirected output may not
+# expose .buffer, and wrapping a non-buffered stream raises AttributeError.
+try:
+    if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+        if hasattr(sys.stdout, "buffer"):
+            sys.stdout = io.TextIOWrapper(
+                sys.stdout.buffer, encoding="utf-8", errors="replace")
+except Exception:
+    pass
+try:
+    if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
+        if hasattr(sys.stderr, "buffer"):
+            sys.stderr = io.TextIOWrapper(
+                sys.stderr.buffer, encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 class MetaTrader5:
     """
     Thin shim that wraps the Windows native MetaTrader5 module so the rest of
-    the script can keep using the mt5linux instance-based calling style:
-        mt5 = MetaTrader5()
-        mt5.initialize()
-        mt5.copy_rates_from_pos(...)
-    All calls are forwarded to the underlying mt5 module unchanged.
+    the script can keep using the mt5linux instance-based calling style.
     """
     def __getattr__(self, name):
         return getattr(_mt5_module, name)
@@ -124,13 +133,16 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-warnings.filterwarnings("ignore")
+# Suppress only convergence/deprecation warnings — not all warnings.
+# Global suppression hides data leakage and sklearn warnings that matter.
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 # =============================================================================
 # DEBUG HELPERS
 # =============================================================================
 
-DEBUG = True   # set False to suppress verbose prints
+DEBUG = True
 
 def dbg(msg: str) -> None:
     if DEBUG:
@@ -153,11 +165,7 @@ def err(msg: str) -> None:
 # =============================================================================
 
 def tg(msg: str) -> None:
-    """
-    Send a Telegram message. Silent no-op if TELEGRAM_ENABLED is False
-    or if token/chat_id are not configured. Never crashes the main program.
-    Uses only stdlib urllib — no extra pip install needed.
-    """
+    """Send a Telegram message. Silent no-op if not configured."""
     if not TELEGRAM_ENABLED:
         return
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -175,6 +183,13 @@ def tg(msg: str) -> None:
         code = resp.getcode()
         if code != 200:
             warn(f"Telegram returned HTTP {code}")
+            # Retry without HTML parse_mode — dynamic text may contain < > &
+            payload2 = urllib.parse.urlencode({
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text":    msg,
+            }).encode()
+            req2  = urllib.request.Request(url, data=payload2, method="POST")
+            urllib.request.urlopen(req2, timeout=10)
         else:
             dbg(f"Telegram alert sent: {msg[:60]}...")
     except Exception as e:
@@ -182,7 +197,6 @@ def tg(msg: str) -> None:
 
 
 def tg_signal_fired(sig: dict) -> None:
-    """Alert when rule signal fires — before ML filter."""
     tg(
         f"📡 <b>ST-ML Signal</b>\n"
         f"Time: {sig['time']}\n"
@@ -192,12 +206,11 @@ def tg_signal_fired(sig: dict) -> None:
         f"ATR14: {sig['atr14']:.2f}\n"
         f"Entry est: {sig['entry_estimate']:.2f}\n"
         f"SL est: {sig['sl_estimate']:.2f}\n"
-        f"⏳ Checking ML filter..."
+        f"Checking ML filter..."
     )
 
 
 def tg_ml_filtered(sig: dict) -> None:
-    """Alert when ML rejects a rule signal."""
     tg(
         f"🚫 <b>ST-ML Signal FILTERED</b>\n"
         f"Time: {sig['time']}\n"
@@ -209,7 +222,6 @@ def tg_ml_filtered(sig: dict) -> None:
 
 
 def tg_order_sent(sig: dict, order_result: dict) -> None:
-    """Alert when an order is successfully filled."""
     tp_val  = order_result.get('tp', 0)
     atr14   = sig.get('atr14', 0)
     tp_str  = f"{tp_val:.2f} (2 ATR = {2.0*atr14:.0f} pts)" if tp_val else 'NONE'
@@ -223,13 +235,11 @@ def tg_order_sent(sig: dict, order_result: dict) -> None:
         f"SL: {order_result.get('sl', 0):.2f}\n"
         f"TP: {tp_str}\n"
         f"ML proba: {sig.get('consensus_proba', 0):.4f}\n"
-        f"Est net USD: ${sig.get('consensus_net_usd', 0):.0f}\n"
-        f"💡 Modify TP in MT5 to let it run further"
+        f"Est net USD: ${sig.get('consensus_net_usd', 0):.0f}"
     )
 
 
 def tg_order_failed(sig: dict, order_result: dict) -> None:
-    """Alert when an order fails to fill."""
     tg(
         f"❌ <b>ST-ML ORDER FAILED</b>\n"
         f"Direction: {sig['direction']}\n"
@@ -240,7 +250,6 @@ def tg_order_failed(sig: dict, order_result: dict) -> None:
 
 
 def tg_blocked_position(positions: list) -> None:
-    """Alert when blocked by an existing open position."""
     pos_str = "\n".join(
         f"  ticket={p.ticket} magic={p.magic} "
         f"{'BUY' if p.type==0 else 'SELL'} "
@@ -255,7 +264,6 @@ def tg_blocked_position(positions: list) -> None:
 
 
 def tg_retrain_complete(metrics: dict, best_params: dict) -> None:
-    """Alert when model retraining completes."""
     tg(
         f"🔄 <b>ST-ML Model Retrained</b>\n"
         f"AUC: {metrics.get('consensus_clf_auc', 0):.3f}\n"
@@ -269,7 +277,6 @@ def tg_retrain_complete(metrics: dict, best_params: dict) -> None:
 
 
 def tg_error(context: str, error: str) -> None:
-    """Alert on critical errors."""
     tg(f"🚨 <b>ST-ML ERROR</b>\n{context}\n{error}")
 
 
@@ -282,7 +289,6 @@ DAILY_TF_MIN = 1440
 H1_TF_MIN    = 60
 
 UTC_FROM = datetime(2018, 1, 1, tzinfo=timezone.utc)
-UTC_TO   = datetime.now(timezone.utc)
 
 DAILY_EMA_LEN = 100
 DAILY_RSI_LEN = 10
@@ -307,66 +313,45 @@ SLIPPAGE_POINTS           = 0.50
 # =============================================================================
 # LIVE RSI BAND OVERRIDE
 # =============================================================================
-# Forces a specific RSI band in live signal checks regardless of what the
-# walk-forward model selected. Set to None to use the model's chosen band.
-# Based on OOS zone analysis: (55,65) outperforms (50,60) across all metrics:
-#   60-65 zone: 67.7% WR, $205 exp, PF=3.58 (best zone, flagged ◀ strong)
-#   55-60 zone: 61.5% WR, $177 exp, PF=3.39
-# Setting (55,65) captures both zones and matches recent model selections.
-# =============================================================================
 LIVE_RSI_BAND_OVERRIDE = (55, 65)   # set to None to use model's band
 COMMISSION_PER_SIDE_USD   = 0.82
 MNQ_DOLLARS_PER_POINT     = 2.0
 
 # Live execution config
-LIVE_LOT_SIZE        = 1          # number of MNQ contracts
-LIVE_MAGIC           = 20240101   # unique EA magic number
+LIVE_LOT_SIZE        = 1
+LIVE_MAGIC           = 20240101
 LIVE_ORDER_COMMENT   = "ST_ML_v2"
-LIVE_MAX_SPREAD_PTS  = 5.0        # refuse to trade if spread > this many points
-LAST_N_TRADES        = 5          # how many recent historical trades to replay/print
+LIVE_MAX_SPREAD_PTS  = 5.0
+LAST_N_TRADES        = 5
 
 # =============================================================================
 # SESSION GATE CONFIG
 # =============================================================================
-# Only trade during proven high-probability sessions (UTC hours).
-# Based on OOS feature importance: is_us_core + is_london both top predictors.
-# London open (08:00) through US close (21:00) covers ~90% of MNQ edge.
-# Set ENFORCE_SESSION_GATE = False to trade any hour (e.g. manual override).
-# Use --force-session flag on command line to bypass for a single run.
-# =============================================================================
 ENFORCE_SESSION_GATE = True
-SESSION_START_UTC    = 8     # 08:00 UTC = London open (3am ET)
-SESSION_END_UTC      = 21    # 21:00 UTC = 5pm ET (after US close)
+SESSION_START_UTC    = 8
+SESSION_END_UTC      = 21
 
 # =============================================================================
-# TELEGRAM CONFIG
+# TELEGRAM CONFIG — load from environment variables
 # =============================================================================
-# To set up:
-#   1. Message @BotFather on Telegram → /newbot → copy the token
-#   2. Message your bot once, then visit:
-#      https://api.telegram.org/bot<TOKEN>/getUpdates
-#      to find your chat_id
-#   3. Fill in both values below
-# Set TELEGRAM_ENABLED = False to disable all Telegram alerts
-# =============================================================================
+import os as _os
 TELEGRAM_ENABLED  = True
-TELEGRAM_TOKEN    = "8602513961:AAFzTS_2lSxza7soWiF3REUA6GewIgc8Grw"  # ← REVOKE AND REPLACE WITH NEW TOKEN FROM @BotFather
-TELEGRAM_CHAT_ID  = "7902956948"
+TELEGRAM_TOKEN    = _os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID  = _os.environ.get("TELEGRAM_CHAT_ID", "")
 
 WF_TRAIN_BARS = 5000
 WF_OOS_BARS   = 1000
 WF_MIN_FOLDS  = 3
 
-OUT_DIR        = Path(".")
+OUT_DIR          = Path(".")
 LIVE_STATE_FILE  = OUT_DIR / "mnq_live_state.json"
 
 # =============================================================================
 # MODEL PERSISTENCE CONFIG
 # =============================================================================
-MODEL_FILE       = OUT_DIR / "mnq_model.pkl"   # saved model bundle
-PARAMS_FILE      = OUT_DIR / "mnq_best_params.pkl"  # saved best params
-MODEL_MAX_AGE_H  = 24    # hours before model is considered stale and retrains
-                         # set to 0 to always retrain (same as old behaviour)
+MODEL_FILE      = OUT_DIR / "mnq_model.pkl"
+PARAMS_FILE     = OUT_DIR / "mnq_best_params.pkl"
+MODEL_MAX_AGE_H = 24
 
 
 # =============================================================================
@@ -375,35 +360,50 @@ MODEL_MAX_AGE_H  = 24    # hours before model is considered stale and retrains
 
 def get_live_symbol(mt5: MetaTrader5, root: str = SYMBOL_ROOT) -> str:
     """
-    Resolve the active front month contract for live order placement
-    and position checking. Uses highest open interest / volume among
-    all contracts matching the root prefix.
-    Falls back to @MNQ if detection fails.
+    Resolve the active front month contract by highest H1 tick_volume
+    (not symbol_info_tick.volume which is last-trade size).
+    Raises RuntimeError if no tradable front-month found — never falls
+    back to @MNQ since that is data-only and not a tradable symbol.
     """
     try:
         symbols = mt5.symbols_get(f"{root}*")
         if not symbols:
-            dbg(f"No symbols found for {root}* — falling back to @{root}")
-            return f"@{root}"
+            raise RuntimeError(
+                f"No symbols found matching '{root}*' in MT5 — "
+                f"cannot resolve front month for live trading")
+
         candidates = []
         for s in symbols:
             name = s.name
-            # Skip continuous contracts and non-standard names
             if name.startswith("@") or len(name) > 8:
                 continue
-            tick = mt5.symbol_info_tick(name)
-            vol  = getattr(tick, "volume", 0) or 0
-            candidates.append((vol, name))
+            # Use H1 tick_volume from recent bars — not symbol_info_tick.volume
+            # which is just last-trade size and unreliable for contract selection
+            try:
+                rates = mt5.copy_rates_from(
+                    name, _mt5_module.TIMEFRAME_H1,
+                    datetime.now(timezone.utc), 5)
+                if rates is None or len(rates) == 0:
+                    continue
+                vol = sum(r[5] for r in rates)   # index 5 = tick_volume
+                candidates.append((vol, name))
+            except Exception:
+                continue
+
         if not candidates:
-            dbg(f"No front month candidates found — falling back to @{root}")
-            return f"@{root}"
+            raise RuntimeError(
+                f"All '{root}*' contracts returned no H1 data — "
+                f"cannot resolve front month. Check MT5 symbol subscription.")
+
         candidates.sort(reverse=True)
         front = candidates[0][1]
-        dbg(f"Front month resolved: {front} (vol={candidates[0][0]})")
+        dbg(f"Front month resolved: {front} (H1 tick_vol={candidates[0][0]})")
         return front
+
+    except RuntimeError:
+        raise
     except Exception as e:
-        dbg(f"get_live_symbol error: {e} — falling back to @{root}")
-        return f"@{root}"
+        raise RuntimeError(f"get_live_symbol failed: {e}") from e
 
 
 def initialize_mt5() -> MetaTrader5:
@@ -411,13 +411,18 @@ def initialize_mt5() -> MetaTrader5:
     mt5 = MetaTrader5()
     if not mt5.initialize():
         raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
+    # Guard terminal_info — can return None on partial init
     info = mt5.terminal_info()
+    if info is None:
+        raise RuntimeError(
+            f"MT5 initialized but terminal_info() returned None: "
+            f"{mt5.last_error()}")
     dbg(f"MT5 connected | build={info.build} connected={info.connected}")
     return mt5
 
 
 def _tf_map(mt5: MetaTrader5, mins: int) -> int:
-    return {
+    mapping = {
         1:    mt5.TIMEFRAME_M1,
         5:    mt5.TIMEFRAME_M5,
         15:   mt5.TIMEFRAME_M15,
@@ -425,7 +430,12 @@ def _tf_map(mt5: MetaTrader5, mins: int) -> int:
         60:   mt5.TIMEFRAME_H1,
         240:  mt5.TIMEFRAME_H4,
         1440: mt5.TIMEFRAME_D1,
-    }[mins]
+    }
+    if mins not in mapping:
+        raise ValueError(
+            f"Unsupported timeframe: {mins} minutes. "
+            f"Valid values: {sorted(mapping.keys())}")
+    return mapping[mins]
 
 
 def fetch_rates(mt5: MetaTrader5, symbol: str, tf_mins: int,
@@ -435,6 +445,12 @@ def fetch_rates(mt5: MetaTrader5, symbol: str, tf_mins: int,
     if rates is None or len(rates) == 0:
         raise RuntimeError(f"No rates for {symbol} tf={tf_mins}. Error: {mt5.last_error()}")
     df = pd.DataFrame(rates)
+    # Validate required columns exist before feature engineering
+    required = {"time", "open", "high", "low", "close", "tick_volume"}
+    missing  = required - set(df.columns)
+    if missing:
+        raise RuntimeError(
+            f"MT5 returned data missing required columns for {symbol}: {missing}")
     df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
     df = df.rename(columns=str.lower).sort_values("time").reset_index(drop=True)
     dbg(f"Fetched {len(df)} bars | first={df['time'].iloc[0]} last={df['time'].iloc[-1]}")
@@ -448,29 +464,27 @@ def fetch_rates(mt5: MetaTrader5, symbol: str, tf_mins: int,
 def get_open_positions(mt5: MetaTrader5, symbol: str, magic: int) -> list:
     """
     Returns ALL open positions for this symbol regardless of magic number.
-    This ensures System 1 and System 2 cannot both be in a trade simultaneously.
-    magic param kept for logging only — NOT used to filter.
+    Raises RuntimeError if positions_get() returns None (MT5 query error) —
+    never treats a query failure as "no positions" (fail-safe).
     """
     dbg(f"Checking ALL open positions for {symbol} (any magic)...")
     positions = mt5.positions_get(symbol=symbol)
     if positions is None:
-        dbg(f"positions_get returned None (no positions or error): {mt5.last_error()}")
-        return []
-    # CRITICAL: return ALL positions on this symbol — not just our magic
-    # This prevents System 2 opening while System 1 is in a trade and vice versa
-    filtered = list(positions)
-    own      = [p for p in positions if p.magic == magic]
-    other    = [p for p in positions if p.magic != magic]
-    dbg(f"Found {len(filtered)} total positions on {symbol} "
+        raise RuntimeError(
+            f"positions_get(symbol={symbol}) returned None — MT5 query error: "
+            f"{mt5.last_error()}. Cannot confirm position state — aborting.")
+    own   = [p for p in positions if p.magic == magic]
+    other = [p for p in positions if p.magic != magic]
+    dbg(f"Found {len(positions)} total positions on {symbol} "
         f"({len(own)} ours magic={magic}, {len(other)} other systems)")
-    return filtered
+    return list(positions)
 
 
 def has_open_position(mt5: MetaTrader5, symbol: str, magic: int) -> bool:
     """
-    Returns True if there is ANY open position on this symbol.
-    Blocks regardless of which system opened it — System 1 or System 2.
-    This is the PRIMARY guard — no order is ever sent if this returns True.
+    Returns True if ANY open position exists on this symbol.
+    Raises RuntimeError on MT5 query failure (fail-safe — never allows
+    an order when position state is unknown).
     """
     positions = get_open_positions(mt5, symbol, magic)
     if positions:
@@ -486,16 +500,20 @@ def has_open_position(mt5: MetaTrader5, symbol: str, magic: int) -> bool:
     return False
 
 
-def check_spread(mt5: MetaTrader5, symbol: str, max_spread: float) -> bool:
-    """Returns True if spread is acceptable, False if too wide."""
+def check_spread(mt5: MetaTrader5, symbol: str, max_spread_pts: float) -> bool:
+    """
+    Returns True if spread is acceptable.
+    Compares spread in instrument points (ask - bid), not dollars.
+    For MNQ with 0.25pt tick this is correct — 5.0pt max = 20 ticks.
+    """
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
         warn(f"Could not get tick for {symbol}: {mt5.last_error()}")
         return False
     spread = tick.ask - tick.bid
-    dbg(f"Current spread: {spread:.2f} pts (max allowed: {max_spread:.2f})")
-    if spread > max_spread:
-        warn(f"Spread {spread:.2f} exceeds max {max_spread:.2f} — skipping trade")
+    dbg(f"Current spread: {spread:.2f} pts (max allowed: {max_spread_pts:.2f})")
+    if spread > max_spread_pts:
+        warn(f"Spread {spread:.2f} exceeds max {max_spread_pts:.2f} — skipping trade")
         return False
     return True
 
@@ -504,39 +522,67 @@ def check_spread(mt5: MetaTrader5, symbol: str, max_spread: float) -> bool:
 # ORDER EXECUTION
 # =============================================================================
 
+def _round_to_tick(price: float, tick_size: float, digits: int) -> float:
+    """
+    Round price to broker tick size, then to instrument digit precision.
+    Uses tick_size (minimum price increment) not just decimal digits —
+    on futures like MNQ (tick=0.25) digit-only rounding can produce
+    invalid prices like 21450.10 instead of 21450.25.
+    """
+    if tick_size <= 0:
+        tick_size = 0.25   # MNQ default
+    return round(round(price / tick_size) * tick_size, digits)
+
+
 def send_market_order(mt5: MetaTrader5, symbol: str, direction: int,
                       lot: float, sl: float, tp: float,
                       magic: int, comment: str) -> dict:
     """
     Send a market order with SL and TP.
     direction: +1 = BUY, -1 = SELL
-    Returns result dict with success flag and details.
+    Includes a final position check immediately before order_send to
+    close the race window between the upstream guard and execution.
     """
     dbg(f"Preparing order: {'BUY' if direction==1 else 'SELL'} {lot} {symbol} "
         f"SL={sl:.2f} TP={tp if not np.isnan(tp) else 'NONE'}")
-
-    tick = mt5.symbol_info_tick(symbol)
-    if tick is None:
-        return {"success": False, "error": f"Cannot get tick: {mt5.last_error()}"}
 
     info = mt5.symbol_info(symbol)
     if info is None:
         return {"success": False, "error": f"Cannot get symbol info: {mt5.last_error()}"}
 
-    # Round SL/TP to tick size
     tick_size = info.trade_tick_size if info.trade_tick_size > 0 else 0.25
-    def round_price(p):
-        if p is None or np.isnan(p):
+    digits    = info.digits
+
+    def rnd(p):
+        if p is None or (isinstance(p, float) and np.isnan(p)):
             return 0.0
-        return round(round(p / tick_size) * tick_size, 2)
+        return _round_to_tick(float(p), tick_size, digits)
+
+    # ── FINAL GATE: re-check position immediately before order_send ──
+    # Closes the race window between the upstream has_open_position check
+    # and the actual send — another bot or manual trade could open here.
+    final_check = mt5.positions_get(symbol=symbol)
+    if final_check is None:
+        return {"success": False,
+                "error": f"FINAL GATE: positions_get returned None before send: "
+                         f"{mt5.last_error()}"}
+    if len(final_check) > 0:
+        return {"success": False,
+                "error": f"FINAL GATE: position appeared between check and send "
+                         f"— aborting to prevent double entry"}
+
+    # Fresh tick for order price
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        return {"success": False, "error": f"Cannot get tick: {mt5.last_error()}"}
 
     price    = tick.ask if direction == 1 else tick.bid
-    sl_clean = round_price(sl)
-    tp_clean = round_price(tp) if not np.isnan(tp) else 0.0
+    sl_clean = rnd(sl)
+    tp_clean = rnd(tp) if not (isinstance(tp, float) and np.isnan(tp)) else 0.0
 
     order_type = mt5.ORDER_TYPE_BUY if direction == 1 else mt5.ORDER_TYPE_SELL
 
-    # Determine best filling mode for this symbol
+    # Determine best filling mode
     filling = mt5.ORDER_FILLING_RETURN
     sym_fm  = getattr(info, "filling_mode", 0)
     if sym_fm == getattr(mt5, "SYMBOL_FILLING_IOC", 2):
@@ -559,20 +605,24 @@ def send_market_order(mt5: MetaTrader5, symbol: str, direction: int,
         "type_filling": filling,
     }
 
-    dbg(f"Order request: price={price} sl={sl_clean} tp={tp_clean} "
-        f"deviation=20 filling={filling}")
+    dbg(f"Order request: price={price} sl={sl_clean} tp={tp_clean} filling={filling}")
 
     result = mt5.order_send(request)
 
     if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-        # Retry with alternate filling modes
+        # Retry with alternate filling modes — re-fetch tick for fresh price
         for alt_filling in [mt5.ORDER_FILLING_IOC,
                             mt5.ORDER_FILLING_FOK,
                             mt5.ORDER_FILLING_RETURN]:
             if alt_filling == filling:
                 continue
-            dbg(f"Retrying with filling mode {alt_filling}...")
+            # Re-fetch tick to get current price for retry
+            retry_tick = mt5.symbol_info_tick(symbol)
+            if retry_tick is None:
+                continue
+            request["price"]        = retry_tick.ask if direction == 1 else retry_tick.bid
             request["type_filling"] = alt_filling
+            dbg(f"Retrying with filling={alt_filling} price={request['price']:.2f}...")
             result = mt5.order_send(request)
             if result and result.retcode == mt5.TRADE_RETCODE_DONE:
                 dbg(f"Order succeeded with filling mode {alt_filling}")
@@ -584,18 +634,12 @@ def send_market_order(mt5: MetaTrader5, symbol: str, direction: int,
         return {"success": False, "error": err_msg}
 
     if result.retcode != mt5.TRADE_RETCODE_DONE:
-        err_msg = (f"Order failed: retcode={result.retcode} "
-                   f"comment={result.comment}")
+        err_msg = f"Order failed: retcode={result.retcode} comment={result.comment}"
         err(err_msg)
-        return {
-            "success":  False,
-            "retcode":  result.retcode,
-            "error":    err_msg,
-            "comment":  result.comment,
-        }
+        return {"success": False, "retcode": result.retcode,
+                "error": err_msg, "comment": result.comment}
 
-    dbg(f"Order FILLED: ticket={result.order} price={result.price} "
-        f"volume={result.volume}")
+    dbg(f"Order FILLED: ticket={result.order} price={result.price} volume={result.volume}")
     return {
         "success": True,
         "ticket":  result.order,
@@ -618,8 +662,13 @@ def _rsi(s: pd.Series, period: int = 14) -> pd.Series:
     delta = s.diff()
     up    = delta.clip(lower=0)
     down  = (-delta).clip(lower=0)
-    rs    = (up.ewm(alpha=1/period, adjust=False).mean() /
-             down.ewm(alpha=1/period, adjust=False).mean().replace(0, np.nan))
+    avg_up   = up.ewm(alpha=1/period, adjust=False).mean()
+    avg_down = down.ewm(alpha=1/period, adjust=False).mean()
+    # Replace 0 avg_down with a tiny epsilon instead of NaN
+    # so uninterrupted up-moves produce RSI near 100 rather than NaN,
+    # which would silently remove valid bullish-regime rows.
+    avg_down = avg_down.replace(0, 1e-10)
+    rs = avg_up / avg_down
     return 100 - (100 / (1 + rs))
 
 
@@ -709,8 +758,10 @@ def _supertrend_numba(close, basic_upper, basic_lower):
     st          = np.empty(n)
     direction   = np.empty(n, dtype=np.int32)
 
-    direction[0] = 1
-    st[0]        = final_lower[0]
+    # Initialise direction based on price vs bands rather than hardcoding bullish.
+    # Hardcoding direction[0]=1 can distort the first flip sequence on short samples.
+    direction[0] = 1 if close[0] >= basic_lower[0] else -1
+    st[0]        = final_lower[0] if direction[0] == 1 else final_upper[0]
 
     for i in range(1, n):
         if basic_upper[i] < final_upper[i-1] or close[i-1] > final_upper[i-1]:
@@ -794,7 +845,9 @@ def build_daily_features(d: pd.DataFrame) -> pd.DataFrame:
     d["bb_bw_d"]      = bw
     d["bb_pctb_d"]    = pb
     d["cci20_d"]      = _cci(d, 20)
-    d["trade_date"]   = d["time"].dt.floor("D")
+    # Shift daily features by 1 so each H1 bar sees the PRIOR completed D1 bar
+    # not the still-forming current daily candle — prevents look-ahead bias.
+    d["trade_date"]   = d["time"].dt.floor("D") + pd.Timedelta(days=1)
     keep = [
         "trade_date", "close", "ema100", "rsi10", "atr14_d",
         "above_ema100", "ema_gap_pct", "rsi_slope3", "rsi_slope5",
@@ -802,7 +855,7 @@ def build_daily_features(d: pd.DataFrame) -> pd.DataFrame:
         "atr_pctile", "adx14_d", "pdi14_d", "mdi14_d",
         "bb_bw_d", "bb_pctb_d", "cci20_d",
     ]
-    dbg(f"Daily features built: {len(d)} rows")
+    dbg(f"Daily features built: {len(d)} rows (shifted +1 day to prevent look-ahead)")
     return d[keep].rename(columns={"close": "daily_close"})
 
 
@@ -857,6 +910,11 @@ def build_h1_features(h: pd.DataFrame) -> pd.DataFrame:
 
 
 def merge_mtf(h1: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge H1 and Daily frames on trade_date.
+    daily.trade_date is already shifted +1 day in build_daily_features()
+    so each H1 bar sees only the prior completed D1 bar (no look-ahead).
+    """
     dbg("Merging H1 and Daily frames on trade_date...")
     merged = h1.merge(daily, on="trade_date", how="left")
     na_count = merged["rsi10"].isna().sum()
@@ -877,11 +935,9 @@ def get_candidates(df: pd.DataFrame, rsi_band: tuple,
                    st_period: int, st_mult: float,
                    direction: int) -> list[int]:
     """
-    Returns positional (iloc) indices of rows satisfying all 3 entry conditions:
-      1. Daily close above EMA100 (for longs) or below (for shorts)
-      2. Daily RSI10 inside the optimal band
-      3. H1 SuperTrend just flipped in the trade direction
-    df must have clean 0-based RangeIndex (always reset_index before calling).
+    Returns positional (iloc) indices of rows satisfying all 3 entry conditions.
+    For shorts, uses strictly_below_ema (above_ema100 == 0 AND close != ema100)
+    to match the stated rule precisely.
     """
     tag      = f"st_{st_period}_{st_mult}"
     flip_col = f"flip_up_{tag}" if direction == 1 else f"flip_dn_{tag}"
@@ -891,27 +947,25 @@ def get_candidates(df: pd.DataFrame, rsi_band: tuple,
         dbg(f"Flip column {flip_col} not found — skipping")
         return []
 
-    regime_ok = (df["above_ema100"] == 1) if direction == 1 else (df["above_ema100"] == 0)
-    rsi_ok    = df["rsi10"].apply(lambda x: _rsi_in_band(x, lo, hi))
-    flip_ok   = df[flip_col] == 1
-    mask      = regime_ok & rsi_ok & flip_ok
-    positions = list(np.where(mask.values)[0])
-    return positions
+    if direction == 1:
+        regime_ok = (df["above_ema100"] == 1)
+    else:
+        # Strictly below EMA100 — exclude equality (close == ema100)
+        regime_ok = (df["above_ema100"] == 0) & (df.get("daily_close", df["close"]) != df.get("ema100", df["close"]))
+
+    rsi_ok  = df["rsi10"].apply(lambda x: _rsi_in_band(x, lo, hi))
+    flip_ok = df[flip_col] == 1
+    mask    = regime_ok & rsi_ok & flip_ok
+    return list(np.where(mask.values)[0])
 
 
 # =============================================================================
-# TRADE SIMULATION  — positional index only, no label index
+# TRADE SIMULATION
 # =============================================================================
 
 def _simulate_trade(df: pd.DataFrame, pos: int, direction: int,
                     st_col: str, stop_atr_mult: float,
                     tp_mode: str, tp_param: float) -> dict | None:
-    """
-    Simulate one trade starting at positional index pos.
-    Returns trade dict or None if invalid setup.
-    df must have clean 0-based RangeIndex.
-    """
-    # Guard: positional index must be valid
     if pos < 0 or pos >= len(df):
         dbg(f"pos={pos} out of bounds for df len={len(df)}")
         return None
@@ -920,12 +974,10 @@ def _simulate_trade(df: pd.DataFrame, pos: int, direction: int,
     entry = row["close"] + direction * SLIPPAGE_POINTS
     atrv  = row["atr14"]
 
-    # Guard: ATR must be valid and positive
     if pd.isna(atrv) or atrv <= 0:
         dbg(f"Invalid ATR={atrv} at pos={pos}")
         return None
 
-    # --- Compute stop loss ---
     if direction == 1:
         swing_sl   = row.get("swing_low5", np.nan)
         st_sl      = row[st_col] if (
@@ -934,7 +986,7 @@ def _simulate_trade(df: pd.DataFrame, pos: int, direction: int,
         if pd.notna(swing_sl): candidates.append(float(swing_sl))
         if pd.notna(st_sl):    candidates.append(float(st_sl))
         stop = min(candidates)
-        stop = min(stop, entry - 0.25)   # enforce minimum risk
+        stop = min(stop, entry - 0.25)
     else:
         swing_sl   = row.get("swing_high5", np.nan)
         st_sl      = row[st_col] if (
@@ -950,15 +1002,13 @@ def _simulate_trade(df: pd.DataFrame, pos: int, direction: int,
         dbg(f"Zero risk at pos={pos} entry={entry} stop={stop}")
         return None
 
-    # --- Compute initial take profit ---
     if tp_mode == "fixed_rr":
         target = entry + direction * tp_param * risk
     elif tp_mode == "atr_multiple":
         target = entry + direction * tp_param * atrv
     else:
-        target = np.nan   # trailing_st: no fixed target, managed bar-by-bar
+        target = np.nan
 
-    # --- Simulate bar-by-bar ---
     trailing_stop = stop
     end_pos       = min(pos + MAX_HOLD_BARS, len(df) - 1)
     exit_px = exit_time = bars_held = None
@@ -966,7 +1016,6 @@ def _simulate_trade(df: pd.DataFrame, pos: int, direction: int,
     for j in range(pos + 1, end_pos + 1):
         r = df.iloc[j]
 
-        # Update trailing stop for trailing_st mode
         if (tp_mode == "trailing_st"
                 and st_col in df.columns
                 and pd.notna(r.get(st_col))):
@@ -982,6 +1031,9 @@ def _simulate_trade(df: pd.DataFrame, pos: int, direction: int,
 
         if sl_hit and tp_hit:
             # Both hit same bar — conservative: take SL
+            # Note: this creates a small systematic bias vs live fills
+            # where order of execution is unknown. Acknowledged — conservative
+            # assumption is preferred for parameter ranking.
             exit_px = trailing_stop
         elif sl_hit:
             exit_px = trailing_stop - direction * SLIPPAGE_POINTS
@@ -993,7 +1045,6 @@ def _simulate_trade(df: pd.DataFrame, pos: int, direction: int,
             bars_held = j - pos
             break
 
-    # Time-exit if no SL/TP hit
     if exit_px is None:
         lr        = df.iloc[end_pos]
         exit_px   = lr["close"] - direction * SLIPPAGE_POINTS
@@ -1002,10 +1053,8 @@ def _simulate_trade(df: pd.DataFrame, pos: int, direction: int,
 
     gross_points = (exit_px - entry) * direction
     net_usd      = gross_points * MNQ_DOLLARS_PER_POINT - 2 * COMMISSION_PER_SIDE_USD
-
-    # FIX: win = profitable, regardless of exit type
-    win         = int(net_usd > 0)
-    rr_realized = gross_points / risk if risk > 0 else np.nan
+    win          = int(net_usd > 0)
+    rr_realized  = gross_points / risk if risk > 0 else np.nan
 
     return {
         "entry_time":   row["time"],
@@ -1025,7 +1074,7 @@ def _simulate_trade(df: pd.DataFrame, pos: int, direction: int,
 
 
 # =============================================================================
-# PARAMETER SEARCH  (train slice only — never called on OOS data)
+# PARAMETER SEARCH
 # =============================================================================
 
 def parameter_search_on_slice(df: pd.DataFrame) -> pd.DataFrame:
@@ -1055,12 +1104,19 @@ def parameter_search_on_slice(df: pd.DataFrame) -> pd.DataFrame:
                         for tp_param in tp_grid:
                             combos += 1
                             trades = []
+                            # Track open trade end position to prevent overlaps
+                            # in parameter search — overlapping trades overstate
+                            # count and corrupt parameter ranking.
+                            next_valid_pos = 0
                             for pos in positions:
+                                if pos < next_valid_pos:
+                                    continue
                                 tr = _simulate_trade(
                                     df, pos, direction, st_col,
                                     stop_mult, tp_mode, tp_param)
                                 if tr:
                                     trades.append(tr)
+                                    next_valid_pos = pos + tr["bars_held"] + 1
 
                             if len(trades) < 30:
                                 continue
@@ -1100,7 +1156,7 @@ def parameter_search_on_slice(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================================================================
-# FEATURE EXTRACTION  (single shared function — no duplication)
+# FEATURE EXTRACTION
 # =============================================================================
 
 FEATURE_COLS = [
@@ -1125,66 +1181,14 @@ FEATURE_COLS = [
 
 
 def _extract_features(r, st_col: str) -> dict:
-    """Extract ML feature dict from a merged DataFrame row."""
-    # Distance from close to SuperTrend line as % of close
     dist = np.nan
     if (st_col in r.index
             and pd.notna(r.get(st_col))
             and r["close"] != 0):
         dist = (r["close"] - r[st_col]) / r["close"] * 100
 
-    return {
-        "rsi10":         r.get("rsi10"),
-        "ema_gap_pct":   r.get("ema_gap_pct"),
-        "rsi_slope3":    r.get("rsi_slope3"),
-        "rsi_slope5":    r.get("rsi_slope5"),
-        "d_ret1":        r.get("d_ret1"),
-        "d_ret5":        r.get("d_ret5"),
-        "d_ret10":       r.get("d_ret10"),
-        "d_range_pct":   r.get("d_range_pct"),
-        "d_atr_pct":     r.get("d_atr_pct"),
-        "atr_pctile":    r.get("atr_pctile"),
-        "adx14_d":       r.get("adx14_d"),
-        "pdi14_d":       r.get("pdi14_d"),
-        "mdi14_d":       r.get("mdi14_d"),
-        "bb_bw_d":       r.get("bb_bw_d"),
-        "bb_pctb_d":     r.get("bb_pctb_d"),
-        "cci20_d":       r.get("cci20_d"),
-        "ret1":          r.get("ret1"),
-        "ret3":          r.get("ret3"),
-        "ret6":          r.get("ret6"),
-        "ret12":         r.get("ret12"),
-        "rsi14":         r.get("rsi14"),
-        "rsi6":          r.get("rsi6"),
-        "rsi14_slope3":  r.get("rsi14_slope3"),
-        "stoch_k":       r.get("stoch_k"),
-        "stoch_d":       r.get("stoch_d"),
-        "bb_pctb":       r.get("bb_pctb"),
-        "bb_bw":         r.get("bb_bw"),
-        "cci20":         r.get("cci20"),
-        "mfi14":         r.get("mfi14"),
-        "vs_ema20_pct":  r.get("vs_ema20_pct"),
-        "vs_ema50_pct":  r.get("vs_ema50_pct"),
-        "ema_slope20":   r.get("ema_slope20"),
-        "ema_slope50":   r.get("ema_slope50"),
-        "ema9_20_cross": r.get("ema9_20_cross"),
-        "adx14":         r.get("adx14"),
-        "pdi14":         r.get("pdi14"),
-        "mdi14":         r.get("mdi14"),
-        "vs_vwap_pct":   r.get("vs_vwap_pct"),
-        "atr14_pct":     r.get("atr14_pct"),
-        "vol_ratio":     r.get("vol_ratio"),
-        "vol_ratio_6":   r.get("vol_ratio_6"),
-        "range_pct":     r.get("range_pct"),
-        "dist_to_st_pct": dist,
-        "hour":          r.get("hour"),
-        "dow":           r.get("dow"),
-        "bar_of_day":    r.get("bar_of_day"),
-        "is_us_open":    r.get("is_us_open"),
-        "is_us_core":    r.get("is_us_core"),
-        "is_london":     r.get("is_london"),
-        "consec_up":     r.get("consec_up"),
-    }
+    return {col: r.get(col) for col in FEATURE_COLS
+            if col != "dist_to_st_pct"} | {"dist_to_st_pct": dist}
 
 
 def build_ml_dataset(df: pd.DataFrame, params: dict) -> pd.DataFrame:
@@ -1219,6 +1223,13 @@ def build_ml_dataset(df: pd.DataFrame, params: dict) -> pd.DataFrame:
         rows.append(feat)
 
     dbg(f"ML dataset: {len(rows)} trades from {len(positions)} candidates")
+
+    # Guard: return empty DataFrame with correct columns if no trades
+    if not rows:
+        return pd.DataFrame(columns=FEATURE_COLS + ["time", "win", "net_usd",
+                                                     "quality_win", "bars_held",
+                                                     "gross_points", "rr_realized"])
+
     return pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
 
 
@@ -1284,15 +1295,18 @@ def train_consensus_models(mdf: pd.DataFrame) -> dict | None:
     y_c = mdf["quality_win"].astype(int)
     y_r = mdf["net_usd"]
 
-    # Need at least 2 classes to train binary classifiers
     if y_c.nunique() < 2:
         dbg("Only one class in quality_win — skipping ML")
         return None
 
-    clf_names = ["logreg", "rf", "et", "gb"]
-    reg_names = ["ridge", "rfr", "gbr"]
-    tscv      = TimeSeriesSplit(n_splits=5)
+    # Scale n_splits to sample size — hardcoded 5 splits can fail on small datasets
+    # even if they pass MIN_TRAIN_TRADES.
+    n_splits = min(5, max(2, len(mdf) // (MIN_TRAIN_TRADES * 2)))
+    tscv     = TimeSeriesSplit(n_splits=n_splits)
+    dbg(f"TimeSeriesSplit n_splits={n_splits} (dataset size={len(mdf)})")
 
+    clf_names  = ["logreg", "rf", "et", "gb"]
+    reg_names  = ["ridge", "rfr", "gbr"]
     clf_models = {n: _make_clf(n) for n in clf_names}
     clf_oof    = pd.DataFrame(index=mdf.index)
     clf_scores = {}
@@ -1300,26 +1314,36 @@ def train_consensus_models(mdf: pd.DataFrame) -> dict | None:
     for name, model in clf_models.items():
         pred = pd.Series(np.nan, index=mdf.index)
         for tr_i, te_i in tscv.split(X):
-            # Skip fold if only one class in training split
             if y_c.iloc[tr_i].nunique() < 2:
                 continue
-            model.fit(X.iloc[tr_i], y_c.iloc[tr_i])
-            pred.iloc[te_i] = model.predict_proba(X.iloc[te_i])[:, 1]
+            # Guard: skip fold if too few samples for reliable fitting
+            if len(tr_i) < MIN_TRAIN_TRADES:
+                continue
+            try:
+                model.fit(X.iloc[tr_i], y_c.iloc[tr_i])
+                pred.iloc[te_i] = model.predict_proba(X.iloc[te_i])[:, 1]
+            except Exception as e:
+                dbg(f"Classifier {name} fold failed: {e}")
+                continue
         valid = pred.dropna().index
         if len(valid) == 0 or y_c.loc[valid].nunique() < 2:
             dbg(f"Classifier {name}: no valid OOF predictions — skipping")
             continue
-        clf_scores[name] = roc_auc_score(y_c.loc[valid], pred.loc[valid])
-        clf_oof[name]    = pred
-        model.fit(X, y_c)   # refit on full training data
+        try:
+            clf_scores[name] = roc_auc_score(y_c.loc[valid], pred.loc[valid])
+        except Exception as e:
+            dbg(f"AUC computation failed for {name}: {e}")
+            continue
+        clf_oof[name] = pred
+        model.fit(X, y_c)
 
     if not clf_scores:
         dbg("No classifiers trained successfully")
         return None
 
-    scored_clfs = list(clf_scores.keys())
+    scored_clfs          = list(clf_scores.keys())
     clf_oof["consensus"] = clf_oof[scored_clfs].mean(axis=1)
-    valid_idx = clf_oof["consensus"].dropna().index
+    valid_idx            = clf_oof["consensus"].dropna().index
 
     if len(valid_idx) == 0 or y_c.loc[valid_idx].nunique() < 2:
         dbg("Consensus has no valid predictions")
@@ -1328,28 +1352,33 @@ def train_consensus_models(mdf: pd.DataFrame) -> dict | None:
     preds_bin = (clf_oof.loc[valid_idx, "consensus"]
                  >= CONSENSUS_PROBA_THRESHOLD).astype(int)
 
-    # Train regressors
     reg_models = {n: _make_reg(n) for n in reg_names}
     reg_scores = {}
 
     for name, model in reg_models.items():
         pred = pd.Series(np.nan, index=mdf.index)
         for tr_i, te_i in tscv.split(X):
-            model.fit(X.iloc[tr_i], y_r.iloc[tr_i])
-            pred.iloc[te_i] = model.predict(X.iloc[te_i])
+            if len(tr_i) < MIN_TRAIN_TRADES:
+                continue
+            try:
+                model.fit(X.iloc[tr_i], y_r.iloc[tr_i])
+                pred.iloc[te_i] = model.predict(X.iloc[te_i])
+            except Exception as e:
+                dbg(f"Regressor {name} fold failed: {e}")
+                continue
         valid = pred.dropna().index
+        if len(valid) == 0:
+            continue
         reg_scores[name] = mean_absolute_error(y_r.loc[valid], pred.loc[valid])
         model.fit(X, y_r)
 
-    # Feature importances from tree models
     importances = {}
     for name in ["rf", "et", "gb"]:
         if name not in clf_scores:
             continue
         clf = clf_models[name].named_steps["clf"]
         if hasattr(clf, "feature_importances_"):
-            importances[name] = pd.Series(
-                clf.feature_importances_, index=avail_fc)
+            importances[name] = pd.Series(clf.feature_importances_, index=avail_fc)
 
     feat_rank = None
     if importances:
@@ -1384,15 +1413,29 @@ def train_consensus_models(mdf: pd.DataFrame) -> dict | None:
 
 def score_row(row, st_col: str, clf_models: dict, reg_models: dict,
               feature_cols: list, direction: int) -> dict:
-    """Score one bar using the trained consensus models."""
     feat = _extract_features(row, st_col)
-    # Align to exact columns the models were trained on
     X    = pd.DataFrame([feat]).reindex(columns=feature_cols)
 
-    clf_probs = {n: float(m.predict_proba(X)[0, 1])
-                 for n, m in clf_models.items()}
-    reg_preds = {n: float(m.predict(X)[0])
-                 for n, m in reg_models.items()}
+    # Warn if feature row is entirely NaN — signals a column mismatch
+    if X.isnull().all(axis=1).iloc[0]:
+        warn(f"score_row: all features are NaN for st_col={st_col} — "
+             f"possible feature column mismatch. Scores may be unreliable.")
+
+    clf_probs = {}
+    for n, m in clf_models.items():
+        try:
+            clf_probs[n] = float(m.predict_proba(X)[0, 1])
+        except Exception as e:
+            dbg(f"score_row clf {n} failed: {e}")
+            clf_probs[n] = 0.5   # neutral fallback
+
+    reg_preds = {}
+    for n, m in reg_models.items():
+        try:
+            reg_preds[n] = float(m.predict(X)[0])
+        except Exception as e:
+            dbg(f"score_row reg {n} failed: {e}")
+            reg_preds[n] = 0.0
 
     consensus_proba   = float(np.mean(list(clf_probs.values())))
     consensus_net_usd = float(np.mean(list(reg_preds.values())))
@@ -1459,7 +1502,6 @@ def walk_forward_eval(full_df: pd.DataFrame) -> pd.DataFrame:
             print(f"  Not enough trades or single class "
                   f"({len(mdf_train)}) — rule-based only.")
 
-        # OOS evaluation: use context window so indicators are warm
         context_df = full_df.iloc[
             start : start + WF_TRAIN_BARS + WF_OOS_BARS
         ].reset_index(drop=True)
@@ -1529,11 +1571,6 @@ def walk_forward_eval(full_df: pd.DataFrame) -> pd.DataFrame:
 
 def print_last_n_trades(full_df: pd.DataFrame, best_params: dict,
                         result: dict | None, n: int = LAST_N_TRADES) -> None:
-    """
-    Replay the last N historical signal occurrences and print
-    a detailed trade-by-trade breakdown showing exactly what the
-    strategy would have done and why.
-    """
     status(f"LAST {n} HISTORICAL TRADES (most recent signals)")
 
     df        = full_df.reset_index(drop=True)
@@ -1551,7 +1588,6 @@ def print_last_n_trades(full_df: pd.DataFrame, best_params: dict,
         print("  No historical signals found with current best params.")
         return
 
-    # Take last N positions
     last_positions = positions[-n:]
 
     for i, pos in enumerate(last_positions):
@@ -1565,7 +1601,6 @@ def print_last_n_trades(full_df: pd.DataFrame, best_params: dict,
 
         row = df.iloc[pos]
 
-        # ML scoring
         ml_proba   = np.nan
         ml_net_usd = np.nan
         ml_take    = None
@@ -1594,13 +1629,13 @@ def print_last_n_trades(full_df: pd.DataFrame, best_params: dict,
         print(f"  Entry price : {tr['entry_px']:.2f}")
         print(f"  Stop loss   : {tr['stop_px']:.2f}  "
               f"(risk = {tr['risk_points']:.2f} pts)")
-        print(f"  Target      : "
-              f"{tr['target_px']:.2f}" if not pd.isna(tr['target_px'])
-              else f"  Target      : trailing SuperTrend")
+        if not pd.isna(tr['target_px']):
+            print(f"  Target      : {tr['target_px']:.2f}")
+        else:
+            print(f"  Target      : trailing SuperTrend")
         print(f"  Exit time   : {tr['exit_time']}")
         print(f"  Exit price  : {tr['exit_px']:.2f}")
-        print(f"  Bars held   : {tr['bars_held']}  "
-              f"(~{tr['bars_held']}h)")
+        print(f"  Bars held   : {tr['bars_held']}")
         print(f"  Gross pts   : {tr['gross_points']:+.2f}")
         print(f"  Net USD     : ${tr['net_usd']:+.2f}")
         print(f"  R:R realized: {tr['rr_realized']:.2f}R")
@@ -1678,15 +1713,10 @@ def print_wf_report(oos: pd.DataFrame) -> None:
 
 def scan_live_signal(full_df: pd.DataFrame, best_params: dict,
                      result: dict | None) -> dict:
-    """
-    Check the most recent H1 bar for a live entry signal.
-    Returns full signal dict for logging and execution.
-    """
     st_period = int(best_params["st_period"])
     st_mult_v = float(best_params["st_mult"])
     direction = int(best_params["direction"])
 
-    # Apply live RSI band override if set, otherwise use model's chosen band
     if LIVE_RSI_BAND_OVERRIDE is not None:
         rsi_band = LIVE_RSI_BAND_OVERRIDE
         dbg(f"RSI band override active: {rsi_band} "
@@ -1694,9 +1724,9 @@ def scan_live_signal(full_df: pd.DataFrame, best_params: dict,
     else:
         rsi_band = (best_params["rsi_lo"], best_params["rsi_hi"])
 
-    st_col    = f"st_{st_period}_{st_mult_v}"
-    flip_col  = (f"flip_up_{st_col}" if direction == 1
-                 else f"flip_dn_{st_col}")
+    st_col   = f"st_{st_period}_{st_mult_v}"
+    flip_col = (f"flip_up_{st_col}" if direction == 1
+                else f"flip_dn_{st_col}")
 
     latest    = full_df.iloc[-1]
     regime_ok = bool(latest.get("above_ema100") == 1) \
@@ -1706,14 +1736,8 @@ def scan_live_signal(full_df: pd.DataFrame, best_params: dict,
     flip_ok   = bool(latest.get(flip_col, 0) == 1)
 
     dbg(f"Live bar: {latest['time']} close={latest['close']:.2f}")
-    dbg(f"  regime_ok={regime_ok} (above_ema100="
-        f"{latest.get('above_ema100')})")
-    dbg(f"  rsi_ok={rsi_ok} (rsi10={latest.get('rsi10', 0):.1f} "
-        f"band={rsi_band})")
-    dbg(f"  flip_ok={flip_ok} ({flip_col}="
-        f"{latest.get(flip_col, 0)})")
+    dbg(f"  regime_ok={regime_ok} rsi_ok={rsi_ok} flip_ok={flip_ok}")
 
-    # Compute SL for signal output
     atrv      = float(latest.get("atr14", 0))
     entry_est = float(latest["close"]) + direction * SLIPPAGE_POINTS
     sl_est    = entry_est - direction * best_params["stop_mult"] * atrv
@@ -1756,14 +1780,9 @@ def scan_live_signal(full_df: pd.DataFrame, best_params: dict,
                 k: round(v, 4) for k, v in scored["clf_probs"].items()}
             sig["reg_preds"]         = {
                 k: round(v, 2)  for k, v in scored["reg_preds"].items()}
-            dbg(f"  ML consensus_proba={sig['consensus_proba']:.4f} "
-                f"take_trade={sig['take_trade']}")
         except Exception as e:
             sig["scoring_error"] = str(e)
             err(f"Signal scoring error: {e}")
-    else:
-        dbg(f"  ML skipped: rule_signal={sig['rule_signal']} "
-            f"result={'loaded' if result else 'None'}")
 
     return sig
 
@@ -1773,15 +1792,10 @@ def scan_live_signal(full_df: pd.DataFrame, best_params: dict,
 # =============================================================================
 
 def is_in_session(force: bool = False) -> bool:
-    """
-    Returns True if current UTC hour is within the trading session window.
-    London open (08:00) through US close (21:00) UTC.
-    force=True bypasses the check for manual override runs.
-    """
     if not ENFORCE_SESSION_GATE or force:
         dbg("Session gate bypassed")
         return True
-    now_hour = datetime.now(timezone.utc).hour
+    now_hour   = datetime.now(timezone.utc).hour
     in_session = SESSION_START_UTC <= now_hour < SESSION_END_UTC
     dbg(f"Session gate: UTC hour={now_hour} "
         f"window={SESSION_START_UTC}:00-{SESSION_END_UTC}:00 "
@@ -1795,19 +1809,13 @@ def is_in_session(force: bool = False) -> bool:
 
 def run_live(full_df: pd.DataFrame, best_params: dict,
              result: dict | None, force_session: bool = False) -> None:
-    """
-    Live mode: check signal, guard against open positions, send order.
-    This is the production execution function.
-    """
     status("LIVE MODE — checking for trade signal")
 
-    # ── GATE 0: Session gate ───────────────────────────────────────
     if not is_in_session(force=force_session):
         now_hour = datetime.now(timezone.utc).hour
         status(f"OUTSIDE SESSION HOURS — UTC hour={now_hour} "
                f"(window={SESSION_START_UTC}:00-{SESSION_END_UTC}:00). "
-               f"No order sent. Use --force-session to override.")
-        dbg("Use --force-session flag to trade outside session hours")
+               f"No order sent.")
         return
 
     sig = scan_live_signal(full_df, best_params, result)
@@ -1815,12 +1823,10 @@ def run_live(full_df: pd.DataFrame, best_params: dict,
     print(f"\n  Bar time  : {sig['time']}")
     print(f"  Close     : {sig['close']:.2f}")
     print(f"  Direction : {sig['direction']}")
-    print(f"  regime_ok : {sig['regime_ok']}  "
-          f"(daily above EMA100)")
+    print(f"  regime_ok : {sig['regime_ok']}")
     print(f"  rsi_ok    : {sig['rsi_ok']}  "
           f"(RSI10={sig['rsi10']:.1f} in {sig['rsi_band']})")
-    print(f"  st_flip   : {sig['st_flip']}  "
-          f"(SuperTrend flipped)")
+    print(f"  st_flip   : {sig['st_flip']}")
     print(f"  rule_sig  : {sig['rule_signal']}")
     if sig.get("consensus_proba") is not None:
         print(f"  ML proba  : {sig['consensus_proba']:.4f}  "
@@ -1828,62 +1834,42 @@ def run_live(full_df: pd.DataFrame, best_params: dict,
         print(f"  ML net$   : ${sig['consensus_net_usd']:.2f}")
     print(f"  take_trade: {sig['take_trade']}")
 
-    # Save signal state regardless of outcome
     with open(LIVE_STATE_FILE, "w") as f:
         json.dump(sig, f, indent=2, default=str)
-    dbg(f"Signal state saved to {LIVE_STATE_FILE}")
 
-    # ── GATE 1: Rule signal must fire ──────────────────────────────
     if not sig["rule_signal"]:
         status("NO SIGNAL — rule conditions not met. No order sent.")
         return
 
-    # Rule signal fired — alert Telegram
     tg_signal_fired(sig)
 
-    # ── GATE 2: ML must confirm ────────────────────────────────────
     if not sig["take_trade"]:
-        status("SIGNAL FILTERED BY ML — consensus proba below threshold. "
-               "No order sent.")
+        status("SIGNAL FILTERED BY ML — consensus proba below threshold.")
         tg_ml_filtered(sig)
         return
 
-    # ── GATE 3: Open position guard ───────────────────────────────
-    # Reconnect MT5 for order checks (keep connection scoped)
     status("Signal confirmed — connecting MT5 for position check...")
     mt5 = initialize_mt5()
     try:
-        # Resolve front month for position check and order placement
         live_symbol = get_live_symbol(mt5, SYMBOL_ROOT)
         dbg(f"Live trading symbol: {live_symbol}")
 
-        # PRIMARY GUARD: check for any open position on this symbol
         if has_open_position(mt5, live_symbol, LIVE_MAGIC):
-            status("BLOCKED — open position already exists. "
-                   "No order sent. Will check again next bar.")
+            status("BLOCKED — open position already exists. No order sent.")
             positions = mt5.positions_get(symbol=live_symbol) or []
             tg_blocked_position(list(positions))
             return
 
-        # ── GATE 4: Spread check ───────────────────────────────────
         if not check_spread(mt5, live_symbol, LIVE_MAX_SPREAD_PTS):
             status("BLOCKED — spread too wide. No order sent.")
-            tg(f"⚠️ <b>ST-ML BLOCKED</b> — spread too wide on {live_symbol}. "
-               f"No order sent.")
+            tg(f"⚠️ ST-ML BLOCKED — spread too wide on {live_symbol}.")
             return
 
-        # ── EXECUTE ────────────────────────────────────────────────
         direction = 1 if sig["direction"] == "LONG" else -1
         sl        = sig["sl_estimate"]
         atr14     = sig["atr14"]
-
-        # Fixed 2 ATR take profit — overrides trailing_st from backtest params.
-        # Trailing ST exit cannot be automated live (no hourly SL update).
-        # 2 ATR TP gives a clean 2:1 RR and closes automatically.
-        # You can modify or remove the TP manually in MT5 after fill if you
-        # want to let a strong trade run further.
         entry_est = sig["entry_estimate"]
-        tp = round(entry_est + direction * 2.0 * atr14, 2)
+        tp        = round(entry_est + direction * 2.0 * atr14, 2)
 
         status(f"SENDING ORDER: {sig['direction']} {LIVE_LOT_SIZE} {live_symbol} "
                f"SL={sl:.2f} TP={tp:.2f} (2 ATR = {2.0*atr14:.0f} pts)")
@@ -1910,7 +1896,6 @@ def run_live(full_df: pd.DataFrame, best_params: dict,
             sig["order_result"] = order_result
             tg_order_failed(sig, order_result)
 
-        # Update state file with order result
         with open(LIVE_STATE_FILE, "w") as f:
             json.dump(sig, f, indent=2, default=str)
 
@@ -1924,14 +1909,10 @@ def run_live(full_df: pd.DataFrame, best_params: dict,
 
 
 # =============================================================================
-# MODEL PERSISTENCE  — save / load / age check
+# MODEL PERSISTENCE
 # =============================================================================
 
 def save_model(result: dict, best_params: dict) -> None:
-    """
-    Persist the trained model bundle and best params to disk.
-    Saves a timestamp so we can check model age on next run.
-    """
     bundle = {
         "trained_at":  datetime.now(timezone.utc).isoformat(),
         "best_params": best_params,
@@ -1941,17 +1922,10 @@ def save_model(result: dict, best_params: dict) -> None:
         pickle.dump(bundle, f, protocol=pickle.HIGHEST_PROTOCOL)
     with open(PARAMS_FILE, "wb") as f:
         pickle.dump(best_params, f, protocol=pickle.HIGHEST_PROTOCOL)
-    status(f"Model saved → {MODEL_FILE}  "
-           f"(trained at {bundle['trained_at']})")
+    status(f"Model saved → {MODEL_FILE}  (trained at {bundle['trained_at']})")
 
 
 def load_model() -> tuple[dict | None, dict | None, bool]:
-    """
-    Load model bundle from disk if it exists and is not stale.
-    Returns (result, best_params, is_fresh).
-    is_fresh=True  → model loaded successfully and within age limit
-    is_fresh=False → model missing, corrupt, or too old → caller must retrain
-    """
     if not MODEL_FILE.exists() or not PARAMS_FILE.exists():
         dbg("No saved model found — will retrain")
         return None, None, False
@@ -1975,7 +1949,6 @@ def load_model() -> tuple[dict | None, dict | None, bool]:
     status(f"Loaded saved model | trained {age_hours:.1f}h ago "
            f"({bundle['trained_at']})")
 
-    # Print key metrics from saved model so we know what we loaded
     if bundle["result"] and "metrics" in bundle["result"]:
         m = bundle["result"]["metrics"]
         print(f"  Saved model metrics | "
@@ -1984,7 +1957,6 @@ def load_model() -> tuple[dict | None, dict | None, bool]:
               f"recall={m.get('consensus_recall', 0):.3f} "
               f"n={m.get('n_trades', 0)}")
 
-    # Print best params so we know what strategy is loaded
     bp = best_params
     print(f"  Loaded params | rsi=({bp.get('rsi_lo')},{bp.get('rsi_hi')}) "
           f"ST({int(bp.get('st_period',0))},{bp.get('st_mult',0)}) "
@@ -1995,10 +1967,6 @@ def load_model() -> tuple[dict | None, dict | None, bool]:
 
 
 def model_needs_retrain(force: bool = False) -> bool:
-    """
-    Returns True if we need to retrain.
-    Checks: --retrain flag, missing file, or model age exceeded.
-    """
     if force:
         dbg("--retrain flag set — forcing retrain")
         return True
@@ -2028,11 +1996,6 @@ def model_needs_retrain(force: bool = False) -> bool:
 # =============================================================================
 
 def print_rsi_zone_breakdown(oos_trades: pd.DataFrame) -> None:
-    """
-    Break down OOS trade performance by daily RSI10 zone at entry.
-    Helps answer: are RSI>70 flips actually better in strong trends?
-    Shows both unfiltered and ML-filtered results per zone.
-    """
     if oos_trades.empty or "rsi10" not in oos_trades.columns:
         print("\n[RSI ZONE] rsi10 column not found in OOS trades — skipping")
         return
@@ -2062,7 +2025,6 @@ def print_rsi_zone_breakdown(oos_trades: pd.DataFrame) -> None:
         if len(sub) == 0:
             continue
 
-        # Unfiltered
         n    = len(sub)
         wins = (sub["net_usd"] > 0).sum()
         wr   = wins / n
@@ -2072,27 +2034,21 @@ def print_rsi_zone_breakdown(oos_trades: pd.DataFrame) -> None:
         gp   = sub.loc[sub["net_usd"] > 0, "net_usd"].sum()
         pf   = gp / gl if gl > 0 else float("inf")
 
-        # ML filtered
         ml_col = "take_trade_ml" if "take_trade_ml" in sub.columns else None
         if ml_col and (sub[ml_col] == 1).any():
-            ml   = sub[sub[ml_col] == 1]
-            ml_n = len(ml)
-            ml_w = (ml["net_usd"] > 0).sum()
-            ml_wr = ml_w / ml_n if ml_n > 0 else 0
+            ml     = sub[sub[ml_col] == 1]
+            ml_n   = len(ml)
+            ml_w   = (ml["net_usd"] > 0).sum()
+            ml_wr  = ml_w / ml_n if ml_n > 0 else 0
             ml_exp = ml["net_usd"].mean() if ml_n > 0 else 0
             ml_str = f"{ml_n:>6} {ml_wr:>7.1%} {ml_exp:>+9.0f}"
         else:
             ml_str = f"{'—':>6} {'—':>7} {'—':>9}"
 
-        # Flag the best zones
         flag = " ◀ strong" if wr >= 0.65 and n >= 5 else ""
-
         print(f"  {label:<8} {n:>5} {wr:>7.1%} {exp:>+10.0f} {pf:>7.2f} "
               f"{tot:>+10.0f} {ml_str}{flag}")
 
-    print(sep)
-    print("  Zones with N<5 may not be statistically meaningful.")
-    print("  ML filtered = trades where ML consensus said take_trade=True.")
     print(sep)
 
 
@@ -2103,30 +2059,29 @@ def print_rsi_zone_breakdown(oos_trades: pd.DataFrame) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="MNQ SuperTrend ML — Research + Live Execution")
-    parser.add_argument(
-        "--live", action="store_true",
-        help="Run in live signal/execution mode (skip full WF training)")
-    parser.add_argument(
-        "--retrain", action="store_true",
+    parser.add_argument("--live", action="store_true",
+        help="Run in live signal/execution mode")
+    parser.add_argument("--retrain", action="store_true",
         help="Force retrain even if a fresh saved model exists")
-    parser.add_argument(
-        "--no-debug", action="store_true",
+    parser.add_argument("--no-debug", action="store_true",
         help="Suppress debug prints")
-    parser.add_argument(
-        "--force-session", action="store_true",
-        help="Bypass session gate — trade outside normal hours (use carefully)")
+    parser.add_argument("--force-session", action="store_true",
+        help="Bypass session gate")
     args = parser.parse_args()
 
     global DEBUG
     if args.no_debug:
         DEBUG = False
 
+    # UTC_TO evaluated at runtime, not import time
+    utc_to = datetime.now(timezone.utc)
+
     # ── DATA FETCH ──────────────────────────────────────────────────
     status("Connecting to MT5 and fetching data...")
     mt5 = initialize_mt5()
     try:
-        d1 = fetch_rates(mt5, SYMBOL, DAILY_TF_MIN, UTC_FROM, UTC_TO)
-        h1 = fetch_rates(mt5, SYMBOL, H1_TF_MIN,    UTC_FROM, UTC_TO)
+        d1 = fetch_rates(mt5, SYMBOL, DAILY_TF_MIN, UTC_FROM, utc_to)
+        h1 = fetch_rates(mt5, SYMBOL, H1_TF_MIN,    UTC_FROM, utc_to)
     finally:
         mt5.shutdown()
 
@@ -2134,11 +2089,11 @@ def main() -> None:
 
     # ── FEATURE ENGINEERING ─────────────────────────────────────────
     status("Building features...")
-    d1f  = build_daily_features(d1)
-    h1f  = build_h1_features(h1)
+    d1f = build_daily_features(d1)
+    h1f = build_h1_features(h1)
 
     status("Adding SuperTrend variants (Numba JIT — first call compiles)...")
-    h1f  = add_all_supertrends(h1f)
+    h1f = add_all_supertrends(h1f)
 
     status("Merging timeframes...")
     full = (merge_mtf(h1f, d1f)
@@ -2146,17 +2101,21 @@ def main() -> None:
             .reset_index(drop=True))
     print(f"  Merged rows: {len(full)}")
 
-    # ── LIVE MODE: load or retrain, then execute ───────────────────
+    # ── WALK-FORWARD FOLD COUNT DIAGNOSTIC ──────────────────────────
+    n_folds = max(0, (len(full) - WF_TRAIN_BARS) // WF_OOS_BARS)
+    if n_folds < WF_MIN_FOLDS:
+        warn(f"Only {n_folds} folds possible (min={WF_MIN_FOLDS}) — "
+             f"consider reducing WF_TRAIN_BARS or fetching more history.")
+
+    # ── LIVE MODE ───────────────────────────────────────────────────
     if args.live:
         status("LIVE MODE")
 
         if model_needs_retrain(force=args.retrain):
-            # ── Retrain on last training window ───────────────────
             status("LIVE MODE: retraining model on last window...")
-            last_start      = max(0, len(full) - WF_TRAIN_BARS - WF_OOS_BARS)
-            last_train      = full.iloc[
-                last_start : last_start + WF_TRAIN_BARS
-            ].reset_index(drop=True)
+            # Use the most recent WF_TRAIN_BARS — not offset by WF_OOS_BARS
+            last_start      = max(0, len(full) - WF_TRAIN_BARS)
+            last_train      = full.iloc[last_start:].reset_index(drop=True)
 
             final_params_df = parameter_search_on_slice(last_train)
             if final_params_df.empty:
@@ -2177,31 +2136,22 @@ def main() -> None:
                   f"recall={m['consensus_recall']:.3f} "
                   f"n={m['n_trades']}")
 
-            # Save to disk for future runs
             save_model(final_result, best_params)
-
-            # Telegram alert — retrain complete
             tg_retrain_complete(m, best_params)
 
         else:
-            # ── Load from disk — fast path (~1 second) ─────────────
             final_result, best_params, fresh = load_model()
             if not fresh:
-                # Shouldn't happen given model_needs_retrain check, but guard anyway
                 err("Model load failed after age check passed — aborting.")
                 sys.exit(1)
 
-        # Print last N trades and execute
         print_last_n_trades(full, best_params, final_result, LAST_N_TRADES)
         run_live(full, best_params, final_result,
                  force_session=args.force_session)
         return
 
-    # ── RESEARCH MODE: full walk-forward ────────────────────────────
-    n_folds = (len(full) - WF_TRAIN_BARS) // WF_OOS_BARS
+    # ── RESEARCH MODE ───────────────────────────────────────────────
     print(f"  Estimated folds: {n_folds}")
-    if n_folds < WF_MIN_FOLDS:
-        warn(f"Only {n_folds} folds possible — consider reducing WF_TRAIN_BARS.")
 
     status("Starting walk-forward evaluation...")
     oos_trades = walk_forward_eval(full)
@@ -2213,12 +2163,10 @@ def main() -> None:
     print_wf_report(oos_trades)
     print_rsi_zone_breakdown(oos_trades)
 
-    # ── FINAL MODEL ─────────────────────────────────────────────────
+    # ── FINAL MODEL — use most recent WF_TRAIN_BARS ─────────────────
     status("Training final model on last window...")
-    last_start      = max(0, len(full) - WF_TRAIN_BARS - WF_OOS_BARS)
-    last_train      = full.iloc[
-        last_start : last_start + WF_TRAIN_BARS
-    ].reset_index(drop=True)
+    last_start      = max(0, len(full) - WF_TRAIN_BARS)
+    last_train      = full.iloc[last_start:].reset_index(drop=True)
     final_params_df = parameter_search_on_slice(last_train)
 
     if final_params_df.empty:
@@ -2237,52 +2185,33 @@ def main() -> None:
         if m["feature_rank"] is not None:
             print("\n  Top 15 features:")
             print(m["feature_rank"].head(15).to_string())
-
-        # Save model so --live mode can load it without retraining
         save_model(final_result, best_params)
+    else:
+        warn("Final model training failed — model not saved.")
 
-    # ── LAST N TRADES ────────────────────────────────────────────────
     print_last_n_trades(full, best_params, final_result, LAST_N_TRADES)
 
-    # ── LIVE SIGNAL CHECK ────────────────────────────────────────────
     sig = scan_live_signal(full, best_params, final_result)
     status("CURRENT LIVE SIGNAL")
     print(json.dumps(sig, indent=2, default=str))
 
-    # ── SAVE OUTPUTS ─────────────────────────────────────────────────
     oos_trades.to_csv(OUT_DIR / "mnq_oos_trades.csv", index=False)
     final_params_df.to_csv(OUT_DIR / "mnq_param_search.csv", index=False)
     with open(OUT_DIR / "mnq_live_signal.json", "w") as f:
         json.dump(sig, f, indent=2, default=str)
 
-    status(f"Outputs saved to {OUT_DIR.resolve()}")
-    print("  mnq_oos_trades.csv    — all OOS trades with ML scores")
-    print("  mnq_param_search.csv  — ranked parameter combinations")
-    print("  mnq_live_signal.json  — current bar signal")
-    print("  mnq_model.pkl         — saved model (auto-loaded by --live)")
-    print("  mnq_best_params.pkl   — saved best params")
-    print()
-    print("  LIVE MODE commands:")
-    print("  python supertrend_ml.py --live            "
-          "# load saved model, check signal, execute")
-    print("  python supertrend_ml.py --live --retrain  "
-          "# force retrain then execute")
-    print()
-    print("  Recommended cron setup:")
-    print("  # Check signal every hour (uses saved model — fast):")
-    print("  0 * * * * cd ~/projects/mt5-python && "
-          ".venv/bin/python supertrend_ml.py --live --no-debug "
-          ">> live_log.txt 2>&1")
-    print()
-    print("  # Force retrain every Sunday at 18:00 UTC (weekly refresh):")
-    print("  0 18 * * 0 cd ~/projects/mt5-python && "
-          ".venv/bin/python supertrend_ml.py --live --retrain --no-debug "
-          ">> live_log.txt 2>&1")
-    print()
-    print("  # Full research re-validation every month (first Sunday):")
-    print("  0 20 1-7 * 0 cd ~/projects/mt5-python && "
-          ".venv/bin/python supertrend_ml.py --no-debug "
-          ">> research_log.txt 2>&1")
+    # Only print saved-model commands if model was actually saved
+    if final_result:
+        status(f"Outputs saved to {OUT_DIR.resolve()}")
+        print("  mnq_oos_trades.csv    — all OOS trades with ML scores")
+        print("  mnq_param_search.csv  — ranked parameter combinations")
+        print("  mnq_live_signal.json  — current bar signal")
+        print("  mnq_model.pkl         — saved model (auto-loaded by --live)")
+        print("  mnq_best_params.pkl   — saved best params")
+        print()
+        print("  LIVE MODE commands:")
+        print("  python supertrend_ml_win.py --live")
+        print("  python supertrend_ml_win.py --live --retrain")
 
 
 if __name__ == "__main__":

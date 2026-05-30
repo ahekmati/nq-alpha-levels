@@ -1,57 +1,21 @@
-# =============================================================================
-# NQ Alpha Levels — .gitignore
-# =============================================================================
-
-# Credentials
+# Credentials — never commit
 .env
 *.env
 
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.venv/
-venv/
-*.egg-info/
-
-# OS
-.DS_Store
-Thumbs.db
+# Model and data — large, regenerated on VPS
+levels_xgb_model.joblib
+ensemble_models.joblib
+levels_dataset.csv
 
 # Logs
 logs/
 *.log
-*.txt
-!requirements.txt
-# All data and output files
-*.csv
-*.json
-*.pkl
-*.joblib
-*.h5
-*.pt
-*.onnx
 
-# Numba cache
-__numba_cache__/
-.numba_cache/
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
 
-# Output and research folders
-atr_dip_study_mnq/
-backtest_output/
-data_mnq_bear_segments/
-mnq_atr_dip_meta_scan/
-output/
-history/
-research_mnq_bear_model/
-research_mnq_model_scan/
-research_mnq_swing_meanrev/
-research_mnq_swing_meanrev_recovery/
-validation_run_441/
-validation_run_441_v3/
-validation_run_441_v4/
-validation_variant8_deepcheck/
-logs/
-
-
+# Virtual environment — never push this
+.venv/
+venv/

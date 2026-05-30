@@ -1,35 +1,6 @@
-# =============================================================================
-# requirements.txt
-# NQ Alpha Levels — Python dependencies
-# Install with: pip install -r requirements.txt
-# =============================================================================
-
-# Core data
-numpy>=1.24.0
+MetaTrader5>=5.0.45
 pandas>=2.0.0
-
-# Machine learning
-scikit-learn>=1.3.0
+numpy>=1.24.0
 xgboost>=2.0.0
+scikit-learn>=1.3.0
 joblib>=1.3.0
-
-# MT5 bridge (Linux) — comment out if running on Windows directly
-mt5linux>=0.1.9
-
-# Deep learning (only needed for lstmnq.py — comment out if not using)
-# tensorflow>=2.13.0
-
-# HTTP requests (used by nq_alpha_levels_bot.py)
-requests>=2.31.0
-
-# JIT compilation for SuperTrend
-numba>=0.57.0
-
-# Plotting (only needed for research scripts)
-matplotlib>=3.7.0
-
-# HMM models (only needed for hmm scripts)
-hmmlearn>=0.3.0
-
-# Utilities
-python-dotenv>=1.0.0

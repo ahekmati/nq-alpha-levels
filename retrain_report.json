@@ -1,0 +1,21 @@
+{
+  "timestamp": "2026-05-28T17:01:58.057433+00:00",
+  "symbol": "@MNQ",
+  "timeframe": "H1",
+  "n_bars_pulled": 50000,
+  "n_samples": 2264,
+  "n_wins": 846,
+  "n_losses": 1418,
+  "date_range_start": "2019-05-09",
+  "date_range_end": "2026-05-25",
+  "auc": 0.7047305841280578,
+  "auc_std": 0.031196339725498838,
+  "auc_change": 0.0,
+  "baseline_auc": 0.7047305841280578,
+  "oos_trades": 385,
+  "oos_win_rate": 0.6077922077922078,
+  "oos_pf": 2.3245033112582782,
+  "oos_expectancy": 0.5194805194805194,
+  "model_saved": true,
+  "reason": "AUC checks passed"
+}

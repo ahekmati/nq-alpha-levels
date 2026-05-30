@@ -1,0 +1,21 @@
+{
+  "time": "2026-05-28 17:00:00+00:00",
+  "close": 30329.5,
+  "direction": "LONG",
+  "regime_ok": true,
+  "rsi10": 76.60158443480002,
+  "rsi_band": [
+    50,
+    60
+  ],
+  "rsi_ok": false,
+  "st_flip": false,
+  "rule_signal": false,
+  "entry_estimate": 30330.0,
+  "sl_estimate": 30226.84,
+  "tp_estimate": null,
+  "atr14": 103.16,
+  "consensus_proba": null,
+  "consensus_net_usd": null,
+  "take_trade": false
+}

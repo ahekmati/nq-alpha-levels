@@ -36,6 +36,8 @@ import MetaTrader5 as mt5
 DATASET_PATH  = "levels_dataset.csv"
 MODEL_PATH    = "levels_xgb_model.joblib"
 SCORE_THRESH  = 0.60
+REPORT_PATH   = "retrain_report.json"
+BASELINE_PATH = "retrain_baseline.json"
 R_TARGET      = 1.5
 SL_ATR        = 1.0      # stop loss multiplier (used in ensemble scan)
 TP_R          = 2.0      # take profit multiplier (used in ensemble scan)
@@ -232,13 +234,23 @@ def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     gain = delta.clip(lower=0).ewm(span=period, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(span=period, adjust=False).mean()
-    rs = gain / loss.replace(0, np.nan)
+    # Replace 0 loss with tiny epsilon so sustained uptrends give RSI ~100
+    # instead of NaN, which would silently drop valid feature rows.
+    rs = gain / loss.replace(0, 1e-10)
     return 100 - (100 / (1 + rs))
 
 
 def calc_atr_percentile(atr_series: pd.Series, window: int = 100) -> pd.Series:
-    """Rolling percentile rank of ATR — measures if volatility is expanding."""
-    return atr_series.rolling(window).rank(pct=True)
+    """
+    Rolling percentile rank of the current ATR value vs the prior window.
+    Returns 0.0-1.0 where 1.0 means current ATR is at the top of its range.
+    Fixed: uses apply to rank only the last value against the window,
+    not rank all values inside the window (which gives wrong distribution).
+    """
+    return atr_series.rolling(window).apply(
+        lambda x: (x[:-1] < x[-1]).sum() / (len(x) - 1) if len(x) > 1 else 0.5,
+        raw=True
+    )
 
 
 
@@ -260,7 +272,7 @@ def find_swing_lows(df: pd.DataFrame, lookback: int = SWING_LOOKBACK) -> pd.Data
 
     for i in range(lookback, len(df) - lookback):
         window = lows[i - lookback: i + lookback + 1]
-        if lows[i] == window.min() and list(window).count(lows[i]) == 1:
+        if lows[i] == window.min():
             swings.append({
                 "bar_index":        i,
                 "timestamp":        df.index[i],
@@ -322,7 +334,7 @@ def find_retests(df: pd.DataFrame, swings: pd.DataFrame) -> list[dict]:
                 broken = True
                 break
 
-            currently_in_zone = (price_low <= zone_hi) and (price_low >= zone_lo - zone_width)
+            currently_in_zone = (price_low <= zone_hi) and (price_low >= zone_lo)
 
             if not in_zone:
                 if currently_in_zone:
@@ -514,6 +526,7 @@ def extract_features(df: pd.DataFrame, htf_df: pd.DataFrame,
 
         records.append({
             "timestamp":            ts,
+            "row_id":               r.get("row_id", None),   # preserved for scan score lookup
             # Level quality
             "touch_count":          touch_count,
             "level_age_bars":       min(level_age_bars, 500),
@@ -551,6 +564,9 @@ def extract_features(df: pd.DataFrame, htf_df: pd.DataFrame,
 
             # HTF key level proximity
             **_htf_feats,
+
+            # Meta — not ML features, used by study() for SL/TP simulation
+            "atr_at_retest":        atr_val,
 
             # Label
             "outcome":              outcome,
@@ -626,7 +642,7 @@ def train(dataset_path: str = DATASET_PATH):
     df["outcome"] = df["outcome"].astype(int)
     df.sort_values("timestamp", inplace=True)
 
-    feature_cols = [c for c in df.columns if c not in ("timestamp", "outcome")]
+    feature_cols = [c for c in df.columns if c not in ("timestamp", "outcome", "atr_at_retest", "row_id")]
     X = df[feature_cols]
     y = df["outcome"]
 
@@ -679,7 +695,7 @@ def validate(dataset_path: str = DATASET_PATH, n_splits: int = 5,
     df.sort_values("timestamp", inplace=True)
     df.reset_index(drop=True, inplace=True)
 
-    feature_cols = [c for c in df.columns if c not in ("timestamp", "outcome")]
+    feature_cols = [c for c in df.columns if c not in ("timestamp", "outcome", "atr_at_retest", "row_id")]
     X = df[feature_cols].values
     y = df["outcome"].values
     n = len(df)
@@ -848,6 +864,7 @@ def scan(symbol: str, tf_label: str, n_bars: int = 3000,
             in_zone = in_z
 
         retests_now.append({
+            "row_id":             len(retests_now),   # unique per-level ID for score lookup
             "level_price":        level,
             "level_origin_i":     origin_i,
             "level_origin_ts":    sw["timestamp"],
@@ -881,40 +898,57 @@ def scan(symbol: str, tf_label: str, n_bars: int = 3000,
     X     = features[feat_cols].fillna(0)
     probs = model.predict_proba(X)[:, 1]
 
+    # Key probabilities by row_id — all live candidates share the same bar
+    # timestamp so a timestamp-keyed dict causes later entries to overwrite
+    # earlier ones, giving multiple levels the wrong or identical score.
+    if "row_id" in features.columns:
+        prob_by_id = dict(zip(features["row_id"].values, probs))
+    else:
+        prob_by_id = {}
+
     results = []
-    for idx, r in enumerate(retests_now[:len(probs)]):
+    for r in retests_now:
+        rid = r.get("row_id")
+        if rid is not None and rid in prob_by_id:
+            p = prob_by_id[rid]
+        else:
+            continue   # this retest was skipped by extract_features — omit it
+        # Use min_score (user-supplied threshold) not global SCORE_THRESH so
+        # filtering and labeling always agree when a custom threshold is passed.
         results.append({
             "Level":       f"{r['level_price']:.2f}",
             "Distance":    f"{r['dist_atr']:.2f} ATR",
             "Age (bars)":  last_i - r["level_origin_i"],
             "Touches":     r["touch_count"],
-            "ML Score":    f"{probs[idx]:.1%}",
-            "Signal":      "✅ BUY ZONE" if probs[idx] >= SCORE_THRESH else "⚠️  WATCH",
+            "_prob":       p,
+            "ML Score":    f"{p:.1%}",
+            "Signal":      "✅ BUY ZONE" if p >= min_score else "⚠️  WATCH",
         })
 
-    results_df = pd.DataFrame(results).sort_values("ML Score", ascending=False)
+    results_df = pd.DataFrame(results).sort_values("_prob", ascending=False).drop(columns=["_prob"])
 
     # Apply min_score filter and top-N limit
     if min_score > 0:
         results_df = results_df[results_df["ML Score"].str.rstrip("%").astype(float) >= min_score * 100]
     results_df = results_df.head(top)
 
-    approaching = results_df[results_df["Distance"].str.split().str[0].astype(float) <= 3.0]
+    approaching = results_df[results_df["Distance"].str.split().str[0].astype(float) <= approach_atr]
     print(f"Showing top {len(results_df)} levels | "
-          f"{len(approaching)} within 3 ATR of current price\n")
+          f"{len(approaching)} within {approach_atr:.1f} ATR of current price\n")
 
     print(f"{'Level':<12} {'Distance':<14} {'Age':>8} {'Touches':>8} "
           f"{'ML Score':>10} {'Signal':<14}")
     print("-" * 70)
     for _, row in results_df.iterrows():
         dist_val = float(row['Distance'].split()[0])
-        marker = " ◀ CLOSE" if dist_val <= 2.0 else ""
+        marker = " ◀ CLOSE" if dist_val <= approach_atr / 2 else ""
         print(f"{row['Level']:<12} {row['Distance']:<14} {row['Age (bars)']:>8} "
               f"{row['Touches']:>8} {row['ML Score']:>10} {row['Signal']:<14}{marker}")
 
+    effective_thresh = min_score if min_score > 0 else SCORE_THRESH
     print(f"\n[SCAN] Current price: {current_price:.2f} | "
           f"ATR: {current_atr:.2f} | "
-          f"Threshold: {SCORE_THRESH:.0%}")
+          f"Threshold: {effective_thresh:.0%}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -977,7 +1011,8 @@ def study(symbol="@MNQ", tf_label="H1", dataset_path=DATASET_PATH,
             scale_pos_weight=(y_tr == 0).sum() / max(y_tr.sum(), 1),
             eval_metric="logloss", random_state=42, verbosity=0,
         )
-        m.fit(X_tr, y_tr)
+        sw_study = _make_sample_weights(df_feat.iloc[:train_end], y_tr)
+        m.fit(X_tr, y_tr, sample_weight=sw_study)
         oos_probs[test_start:test_end] = m.predict_proba(X_te)[:, 1]
 
     df_feat["oos_score"] = oos_probs
@@ -1018,8 +1053,9 @@ def study(symbol="@MNQ", tf_label="H1", dataset_path=DATASET_PATH,
             skipped += 1
             continue
 
-        # Verify timestamp match (within 1 bar)
-        if abs((bars.index[pos] - ts).total_seconds()) > 7200:
+        # Verify timestamp match within 1 bar (3600s for H1)
+        # 7200s was too permissive — could misalign entries around DST or gaps
+        if abs((bars.index[pos] - ts).total_seconds()) > 3600:
             skipped += 1
             continue
 
@@ -1217,7 +1253,7 @@ def find_swing_highs(df: pd.DataFrame, lookback: int = SWING_LOOKBACK) -> pd.Dat
     swings   = []
     for i in range(lookback, len(df) - lookback):
         window = highs[i - lookback: i + lookback + 1]
-        if highs[i] == window.max() and list(window).count(highs[i]) == 1:
+        if highs[i] == window.max():
             swings.append({
                 "bar_index":        i,
                 "timestamp":        df.index[i],
@@ -1259,6 +1295,12 @@ def backtest(symbol="@MNQ", tf_label="H1", n_bars=20000,
     bars      = get_bars(symbol, tf,  n=n_bars)
     htf_bars  = get_bars(symbol, htf, n=n_bars // 4)
     daily     = get_bars(symbol, D1,  n=1000)
+    # Fetch HTF key levels BEFORE shutdown — get_htf_levels calls get_bars
+    # which requires an active MT5 connection.
+    print("[BT] Fetching HTF key levels ...")
+    _bt_htf_levels = get_htf_levels(symbol)
+    print(f"[BT] HTF levels: PDH={_bt_htf_levels['pdh']:.0f} PDL={_bt_htf_levels['pdl']:.0f} "
+          f"PWH={_bt_htf_levels['pwh']:.0f} PWL={_bt_htf_levels['pwl']:.0f}")
     mt5.shutdown()
 
     # ── Daily 100 EMA — trend filter ─────────────────────────────────────────
@@ -1317,7 +1359,8 @@ def backtest(symbol="@MNQ", tf_label="H1", n_bars=20000,
             scale_pos_weight=(y_cp == 0).sum() / max(y_cp.sum(), 1),
             eval_metric="logloss", random_state=42, verbosity=0,
         )
-        m.fit(X_cp, y_cp)
+        sw_cp = _make_sample_weights(subset, y_cp)
+        m.fit(X_cp, y_cp, sample_weight=sw_cp)
         trained_models.append(m)
 
     def get_model(bar_ts):
@@ -1355,10 +1398,23 @@ def backtest(symbol="@MNQ", tf_label="H1", n_bars=20000,
             ref_prices = bars["high"].iloc[origin_i + 1: i]
             max_h = ref_prices.max() if len(ref_prices) > 0 else level
             dep_h = (max_h - level) / atr_val if atr_val > 0 else 0
+            # origin_departure: sharpness of initial departure (first few bars)
+            depart_window = min(5, i - origin_i - 1)
+            if depart_window > 0:
+                post_origin = bars["close"].iloc[origin_i + 1: origin_i + 1 + depart_window]
+                origin_dep = (post_origin.max() - level) / atr_val if atr_val > 0 else 0
+            else:
+                origin_dep = 0.0
         else:                # short — departure is downward from swing high
             ref_prices = bars["low"].iloc[origin_i + 1: i]
             min_l = ref_prices.min() if len(ref_prices) > 0 else level
             dep_h = (level - min_l) / atr_val if atr_val > 0 else 0
+            depart_window = min(5, i - origin_i - 1)
+            if depart_window > 0:
+                post_origin = bars["close"].iloc[origin_i + 1: origin_i + 1 + depart_window]
+                origin_dep = (level - post_origin.min()) / atr_val if atr_val > 0 else 0
+            else:
+                origin_dep = 0.0
 
         consec_dir = 0
         for k in range(i - 1, max(0, i - 8), -1):
@@ -1408,7 +1464,7 @@ def backtest(symbol="@MNQ", tf_label="H1", n_bars=20000,
             "touch_count":         touch_count,
             "level_age_bars":      min(i - origin_i, 500),
             "departure_height":    dep_h,
-            "origin_departure":    dep_h,
+            "origin_departure":    origin_dep,
             "approach_drop_atr":   abs(bars["close"].iloc[max(0,i-5)] - close) / atr_val,
             "approach_consec_red": consec_dir,
             "approach_vol_ratio":  vol_ratio,
@@ -1437,14 +1493,15 @@ def backtest(symbol="@MNQ", tf_label="H1", n_bars=20000,
         }
 
     # ── Precompute swing lows AND highs ───────────────────────────────────────
-    MIN_BAR    = max(250, SWING_LOOKBACK * 2)
+    # MIN_BAR must exceed the longest indicator warmup window.
+    # EMA200 needs ~200 bars, ATR percentile window=100, plus swing lookback buffer.
+    # Using max(250, ...) ensures all indicators are properly warmed before the
+    # first trade is considered.
+    MIN_BAR    = max(250, SWING_LOOKBACK * 2, 200 + ATR_PERIOD)
     closes_arr = bars["close"].values
     highs_arr  = bars["high"].values
 
-    print("[BT] Fetching HTF key levels ...")
-    _bt_htf_levels = get_htf_levels(symbol)
-    print(f"[BT] HTF levels: PDH={_bt_htf_levels['pdh']:.0f} PDL={_bt_htf_levels['pdl']:.0f} "
-          f"PWH={_bt_htf_levels['pwh']:.0f} PWL={_bt_htf_levels['pwl']:.0f}")
+    # _bt_htf_levels already fetched before mt5.shutdown() above
 
     print("[BT] Precomputing swing lows and highs ...")
     all_lows  = find_swing_lows(bars,  lookback=SWING_LOOKBACK)
@@ -1501,7 +1558,7 @@ def backtest(symbol="@MNQ", tf_label="H1", n_bars=20000,
             if exit_reason:
                 pnl_pts = (exit_price - position["entry"]) * dir
                 pnl_r   = pnl_pts / position["risk"]
-                pnl_usd = pnl_pts * 2 * dir
+                pnl_usd = pnl_pts * 2   # MNQ = $2/point; direction already in pnl_pts
 
                 trades.append({
                     "direction":    "LONG" if dir == 1 else "SHORT",
@@ -1726,8 +1783,7 @@ def retrain(symbol="@MNQ", tf_label="H1", n_bars=50000,
     from xgboost import XGBClassifier
     from sklearn.model_selection import StratifiedKFold, cross_val_score
 
-    REPORT_PATH   = "retrain_report.json"
-    BASELINE_PATH = "retrain_baseline.json"
+    # REPORT_PATH and BASELINE_PATH are defined at module level
 
     print("\n" + "=" * 65)
     print("RETRAIN PIPELINE")
@@ -1744,7 +1800,7 @@ def retrain(symbol="@MNQ", tf_label="H1", n_bars=50000,
     df.sort_values("timestamp", inplace=True)
     df.reset_index(drop=True, inplace=True)
 
-    feature_cols = [c for c in df.columns if c not in ("timestamp", "outcome")]
+    feature_cols = [c for c in df.columns if c not in ("timestamp", "outcome", "atr_at_retest", "row_id")]
     X = df[feature_cols]
     y = df["outcome"]
 
@@ -1792,7 +1848,8 @@ def retrain(symbol="@MNQ", tf_label="H1", n_bars=50000,
             scale_pos_weight=(y_tr == 0).sum() / max(y_tr.sum(), 1),
             eval_metric="logloss", random_state=42, verbosity=0,
         )
-        m.fit(X_tr, y_tr)
+        sw_retrain_fold = _make_sample_weights(df.iloc[:train_end], y_tr)
+        m.fit(X_tr, y_tr, sample_weight=sw_retrain_fold)
         probs = m.predict_proba(X_te)[:, 1]
         oos_probs[test_start:test_end] = probs
 
@@ -2001,7 +2058,7 @@ def ensemble(symbol="@MNQ", tf_label="H1", n_bars=3000,
     df.sort_values("timestamp", inplace=True)
     df.reset_index(drop=True, inplace=True)
 
-    feature_cols = [c for c in df.columns if c not in ("timestamp", "outcome")]
+    feature_cols = [c for c in df.columns if c not in ("timestamp", "outcome", "atr_at_retest", "row_id")]
     X = df[feature_cols].values
     y = df["outcome"].values
     n = len(df)
@@ -2155,18 +2212,20 @@ def ensemble(symbol="@MNQ", tf_label="H1", n_bars=3000,
 
     connect()
     print(f"\n[ENSEMBLE] Pulling {n_bars} bars for live scan ...")
-    bars     = get_bars(symbol, tf,  n=n_bars)
-    htf_bars = get_bars(symbol, htf, n=n_bars // 4)
+    bars      = get_bars(symbol, tf,  n=n_bars)
+    htf_bars  = get_bars(symbol, htf, n=n_bars // 4)
+    daily_d1  = get_bars(symbol, TIMEFRAME_D1, n=200)   # for real daily EMA100
+    # Fetch HTF key levels BEFORE shutdown — requires active MT5 connection
+    _ens_htf  = get_htf_levels(symbol)
     mt5.shutdown()
 
     atr_s         = calc_atr(bars, ATR_PERIOD)
     atr_val       = atr_s.iloc[-1]
     current_price = bars["close"].iloc[-1]
-    _ens_htf      = get_htf_levels(symbol)
 
-    # Daily trend
-    daily_ema100  = calc_ema(bars["close"], 100)  # proxy on H1
-    trend_bullish = current_price > daily_ema100.iloc[-1]
+    # Daily trend: use real D1 bars not H1 EMA proxy — consistent with backtest
+    daily_ema100  = calc_ema(daily_d1["close"], 100)
+    trend_bullish = daily_d1["close"].iloc[-1] > daily_ema100.iloc[-1]
 
     print(f"\n{'='*65}")
     print(f"LIVE ENSEMBLE SCAN — {symbol} {tf_label}")
@@ -2218,6 +2277,19 @@ def ensemble(symbol="@MNQ", tf_label="H1", n_bars=3000,
 
     print(f"Found {len(candidates)} active levels — scoring with all models...\n")
 
+    # Precompute all indicators once outside the level loop.
+    # Previously they were recomputed inside the loop on every level iteration —
+    # inefficient and risks subtle per-level differences vs training feature values.
+    _ens_ema20     = calc_ema(bars["close"], 20)
+    _ens_ema50     = calc_ema(bars["close"], 50)
+    _ens_ema200    = calc_ema(bars["close"], 200)
+    _ens_rsi       = calc_rsi(bars["close"])
+    _ens_atp       = calc_atr_percentile(atr_s)
+    _ens_vol_ma    = bars["volume"].rolling(20).mean()
+    _ens_htf_ema20 = calc_ema(htf_bars["close"], 20)
+    _ens_htf_ema50 = calc_ema(htf_bars["close"], 50)
+    _ens_htf_atr_s = calc_atr(htf_bars)
+
     # Score each level with all models
     level_results = []
 
@@ -2243,35 +2315,38 @@ def ensemble(symbol="@MNQ", tf_label="H1", n_bars=3000,
             else:
                 break
 
-        vol_ma    = bars["volume"].rolling(20).mean().iloc[i]
-        vol_ratio = bars["volume"].iloc[i] / vol_ma if vol_ma > 0 else 1.0
-
         ref_highs = bars["high"].iloc[origin_i+1:i]
         max_h     = ref_highs.max() if len(ref_highs) > 0 else level
         dep_h     = (max_h - level) / atr_val if atr_val > 0 else 0
+        # origin_departure: sharpness of initial post-origin departure (first 5 bars)
+        ens_depart_window = min(5, i - origin_i - 1)
+        if ens_depart_window > 0:
+            ens_post_origin = bars["close"].iloc[origin_i + 1: origin_i + 1 + ens_depart_window]
+            ens_origin_dep  = (ens_post_origin.max() - level) / atr_val if atr_val > 0 else 0
+        else:
+            ens_origin_dep = 0.0
 
-        htf_ema20  = calc_ema(htf_bars["close"], 20)
-        htf_ema50  = calc_ema(htf_bars["close"], 50)
-        htf_atr_s  = calc_atr(htf_bars)
         htf_prior  = htf_bars[htf_bars.index <= ts]
         if len(htf_prior) < 5:
             continue
         htf_c    = htf_prior["close"].iloc[-1]
-        htf_e20  = htf_ema20.reindex(htf_prior.index).iloc[-1]
-        htf_e50  = htf_ema50.reindex(htf_prior.index).iloc[-1]
-        htf_a    = htf_atr_s.reindex(htf_prior.index).iloc[-1]
+        htf_e20  = _ens_htf_ema20.reindex(htf_prior.index).iloc[-1]
+        htf_e50  = _ens_htf_ema50.reindex(htf_prior.index).iloc[-1]
+        htf_a    = _ens_htf_atr_s.reindex(htf_prior.index).iloc[-1]
         htf_trend = 1 if htf_c > htf_e20 else -1
         htf_pct   = (htf_c - htf_e20) / htf_e20 if htf_e20 > 0 else 0
         htf_e20d  = abs(level - htf_e20) / htf_a if htf_a > 0 else 99
         htf_e50d  = abs(level - htf_e50) / htf_a if htf_a > 0 else 99
         htf_conf  = int(min(htf_e20d, htf_e50d) < 0.5)
 
-        ema20  = calc_ema(bars["close"], 20).iloc[i]
-        ema50  = calc_ema(bars["close"], 50).iloc[i]
-        ema200 = calc_ema(bars["close"], 200).iloc[i]
-        rsi    = calc_rsi(bars["close"]).iloc[i]
-        atp    = calc_atr_percentile(atr_s).iloc[i]
+        ema20  = _ens_ema20.iloc[i]
+        ema50  = _ens_ema50.iloc[i]
+        ema200 = _ens_ema200.iloc[i]
+        rsi    = _ens_rsi.iloc[i]
+        atp    = _ens_atp.iloc[i]
         if np.isnan(atp): atp = 0.5
+        vol_ma    = _ens_vol_ma.iloc[i]
+        vol_ratio = bars["volume"].iloc[i] / vol_ma if vol_ma > 0 else 1.0
 
         hour    = ts.hour
         session = 0
@@ -2286,7 +2361,7 @@ def ensemble(symbol="@MNQ", tf_label="H1", n_bars=3000,
             "touch_count":         lv["touch_count"],
             "level_age_bars":      min(lv["age_bars"], 500),
             "departure_height":    dep_h,
-            "origin_departure":    dep_h,
+            "origin_departure":    ens_origin_dep,
             "approach_drop_atr":   abs(bars["close"].iloc[max(0,i-5)] - close) / atr_val,
             "approach_consec_red": consec_red,
             "approach_vol_ratio":  vol_ratio,
@@ -2502,6 +2577,8 @@ if __name__ == "__main__":
                         help="Show top N levels in scan (default 20)")
     parser.add_argument("--min-score", type=float, default=0.0,
                         help="Hide levels below this score in scan (default 0.0 = show all)")
+    parser.add_argument("--approach-atr", type=float, default=3.0,
+                        help="Highlight levels within this many ATR of price in scan (default 3.0)")
     parser.add_argument("--sl-atr",   type=float, default=1.0,
                         help="Stop loss in ATR multiples (default 1.0)")
     parser.add_argument("--tp-r",    type=float, default=2.0,
@@ -2521,7 +2598,9 @@ if __name__ == "__main__":
     elif args.mode == "validate":
         validate(threshold=args.threshold)
     elif args.mode == "scan":
-        scan(args.symbol, args.tf, top=args.top, min_score=args.min_score)
+        scan(args.symbol, args.tf, n_bars=args.bars,
+             approach_atr=args.approach_atr,
+             top=args.top, min_score=args.min_score)
     elif args.mode == "study":
         study(symbol=args.symbol, tf_label=args.tf, min_score=args.threshold)
     elif args.mode == "retrain":
