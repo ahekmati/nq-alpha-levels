@@ -41,6 +41,16 @@ SL_ATR        = 1.0      # stop loss multiplier (used in ensemble scan)
 TP_R          = 2.0      # take profit multiplier (used in ensemble scan)
 ATR_PERIOD    = 14
 
+# Sample weight multipliers for training
+HTF_CONFLUENCE_WIN_WEIGHT  = 1.4   # upweight confluence wins
+HTF_CONFLUENCE_LOSS_WEIGHT = 0.8   # downweight confluence losses
+HTF_OVERHEAD_LOSS_WEIGHT   = 0.7   # downweight losses with tight overhead
+
+# HTF proximity thresholds
+HTF_CONFLUENCE_THRESH      = 0.75  # ATR multiples for support stack count
+HTF_ANY_CONFLUENCE_THRESH  = 0.50  # ATR multiples for htf_any_confluence flag
+HTF_OVERHEAD_TIGHT_THRESH  = 1.50  # ATR multiples for overhead resistance flag
+
 # Level detection params
 SWING_LOOKBACK     = 5      # bars each side to confirm a swing low
 LEVEL_ZONE_ATR     = 0.30   # level zone width = 0.30 * ATR
@@ -54,6 +64,8 @@ TIMEFRAME_M15 = 15
 TIMEFRAME_H1  = 16385
 TIMEFRAME_H4  = 16388
 TIMEFRAME_D1  = 16408
+TIMEFRAME_W1  = 32769
+TIMEFRAME_MN1 = 49153
 
 HTF_MAP = {
     TIMEFRAME_H1:  TIMEFRAME_H4,
@@ -90,6 +102,116 @@ def get_bars(symbol: str, tf: int, n: int = 5000) -> pd.DataFrame:
     df.set_index("time", inplace=True)
     df.rename(columns={"tick_volume": "volume"}, inplace=True)
     return df[["open", "high", "low", "close", "volume"]].copy()
+
+
+def get_htf_levels(symbol: str) -> dict:
+    """
+    Pull Previous Day / Week / Month High and Low directly from MT5.
+    Uses iloc[-2] (the fully completed prior bar) on each timeframe.
+    Returns a dict with pdh, pdl, pwh, pwl, pmh, pml.
+    Called once per scan — negligible overhead (3 x 5 bars).
+    """
+    empty = {"pdh": 0.0, "pdl": 0.0,
+             "pwh": 0.0, "pwl": 0.0,
+             "pmh": 0.0, "pml": 0.0}
+    try:
+        d1 = get_bars(symbol, TIMEFRAME_D1,  n=5)
+        w1 = get_bars(symbol, TIMEFRAME_W1,  n=5)
+        mn = get_bars(symbol, TIMEFRAME_MN1, n=5)
+        return {
+            "pdh": float(d1["high"].iloc[-2]),
+            "pdl": float(d1["low"].iloc[-2]),
+            "pwh": float(w1["high"].iloc[-2]),
+            "pwl": float(w1["low"].iloc[-2]),
+            "pmh": float(mn["high"].iloc[-2]),
+            "pml": float(mn["low"].iloc[-2]),
+        }
+    except Exception as e:
+        print(f"[HTF] get_htf_levels failed: {e} — using zeros")
+        return empty
+
+
+def htf_features_for_level(level: float, atr_val: float,
+                             htf_levels: dict) -> dict:
+    """
+    Compute all HTF proximity features for a single price level.
+    Centralised here so extract_features, build_feature_row (backtest),
+    build_feature_row (bot) all use identical logic.
+
+    Features:
+      dist_pdh / dist_pdl / dist_pwh / dist_pwl / dist_pmh / dist_pml
+        — signed distance in ATR units (positive = level is below HTF price)
+      htf_support_stack
+        — count of HTF support levels (PDL/PWL/PML) within 0.75 ATR of level
+      dist_nearest_htf_support
+        — ATR distance to the closest HTF support level below the swing low
+      dist_nearest_htf_resistance
+        — ATR distance to the closest HTF resistance level above the swing low
+      overhead_resistance_tight
+        — 1 if any HTF resistance is within 1.5 ATR above (compresses TP)
+      htf_any_confluence
+        — 1 if any HTF support level is within 0.5 ATR of the swing low
+    """
+    if atr_val <= 0:
+        return {k: 0 for k in [
+            "dist_pdh", "dist_pdl", "dist_pwh", "dist_pwl",
+            "dist_pmh", "dist_pml", "htf_support_stack",
+            "dist_nearest_htf_support", "dist_nearest_htf_resistance",
+            "overhead_resistance_tight", "htf_any_confluence",
+        ]}
+
+    pdh = htf_levels.get("pdh", 0.0)
+    pdl = htf_levels.get("pdl", 0.0)
+    pwh = htf_levels.get("pwh", 0.0)
+    pwl = htf_levels.get("pwl", 0.0)
+    pmh = htf_levels.get("pmh", 0.0)
+    pml = htf_levels.get("pml", 0.0)
+
+    # Signed distances — positive means HTF level is above the swing low
+    dist_pdh = (pdh - level) / atr_val if pdh > 0 else 99.0
+    dist_pdl = (level - pdl) / atr_val if pdl > 0 else 99.0
+    dist_pwh = (pwh - level) / atr_val if pwh > 0 else 99.0
+    dist_pwl = (level - pwl) / atr_val if pwl > 0 else 99.0
+    dist_pmh = (pmh - level) / atr_val if pmh > 0 else 99.0
+    dist_pml = (level - pml) / atr_val if pml > 0 else 99.0
+
+    # Support levels below (or at) the swing low — within HTF_CONFLUENCE_THRESH ATR
+    htf_support_stack = sum([
+        1 for d in [dist_pdl, dist_pwl, dist_pml]
+        if abs(d) <= HTF_CONFLUENCE_THRESH
+    ])
+
+    # Nearest HTF support below swing low (smallest positive dist_pXl)
+    support_dists = [d for d in [dist_pdl, dist_pwl, dist_pml]
+                     if 0 <= d]
+    dist_nearest_htf_support = min(support_dists) if support_dists else 99.0
+
+    # Nearest HTF resistance above swing low (smallest positive dist_pXh)
+    resist_dists = [d for d in [dist_pdh, dist_pwh, dist_pmh]
+                    if 0 < d]
+    dist_nearest_htf_resistance = min(resist_dists) if resist_dists else 99.0
+
+    # Tight overhead resistance compresses TP achievability
+    overhead_resistance_tight = int(dist_nearest_htf_resistance < HTF_OVERHEAD_TIGHT_THRESH)
+
+    # Any HTF support within HTF_ANY_CONFLUENCE_THRESH ATR = strong confluence
+    htf_any_confluence = int(any(
+        abs(d) <= HTF_ANY_CONFLUENCE_THRESH for d in [dist_pdl, dist_pwl, dist_pml]
+    ))
+
+    return {
+        "dist_pdh":                   dist_pdh,
+        "dist_pdl":                   dist_pdl,
+        "dist_pwh":                   dist_pwh,
+        "dist_pwl":                   dist_pwl,
+        "dist_pmh":                   dist_pmh,
+        "dist_pml":                   dist_pml,
+        "htf_support_stack":          htf_support_stack,
+        "dist_nearest_htf_support":   dist_nearest_htf_support,
+        "dist_nearest_htf_resistance":dist_nearest_htf_resistance,
+        "overhead_resistance_tight":  overhead_resistance_tight,
+        "htf_any_confluence":         htf_any_confluence,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -249,12 +371,15 @@ def find_retests(df: pd.DataFrame, swings: pd.DataFrame) -> list[dict]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_features(df: pd.DataFrame, htf_df: pd.DataFrame,
-                     retests: list[dict], live_mode: bool = False) -> pd.DataFrame:
+                     retests: list[dict], live_mode: bool = False,
+                     htf_levels: dict = None) -> pd.DataFrame:
     """
     Build one feature row per retest event.
     Features capture: level quality, approach characteristics,
-    retest candle, momentum, HTF context, session.
+    retest candle, momentum, HTF context, session, HTF key levels.
     """
+    if htf_levels is None:
+        htf_levels = {"pdh":0.0,"pdl":0.0,"pwh":0.0,"pwl":0.0,"pmh":0.0,"pml":0.0}
     atr_s      = calc_atr(df, ATR_PERIOD)
     rsi_s      = calc_rsi(df["close"])
     ema20_s    = calc_ema(df["close"], 20)
@@ -384,6 +509,9 @@ def extract_features(df: pd.DataFrame, htf_df: pd.DataFrame,
 
 
 
+        # ── HTF key level proximity ──────────────────────────────────────────
+        _htf_feats = htf_features_for_level(level, atr_val, htf_levels)
+
         records.append({
             "timestamp":            ts,
             # Level quality
@@ -421,6 +549,9 @@ def extract_features(df: pd.DataFrame, htf_df: pd.DataFrame,
             # Entry geometry
             "risk_atr":             risk / atr_val if atr_val > 0 else 0,
 
+            # HTF key level proximity
+            **_htf_feats,
+
             # Label
             "outcome":              outcome,
         })
@@ -438,8 +569,9 @@ def collect(symbol: str, tf_label: str, n_bars: int = 10000):
 
     connect()
     print(f"[COLLECT] Pulling {n_bars} bars for {symbol} {tf_label} ...")
-    df     = get_bars(symbol, tf,  n=n_bars)
-    htf_df = get_bars(symbol, htf, n=n_bars // 4)
+    df         = get_bars(symbol, tf,  n=n_bars)
+    htf_df     = get_bars(symbol, htf, n=n_bars // 4)
+    htf_levels = get_htf_levels(symbol)
     mt5.shutdown()
 
     print("[COLLECT] Finding swing lows ...")
@@ -451,7 +583,7 @@ def collect(symbol: str, tf_label: str, n_bars: int = 10000):
     print(f"[COLLECT] Found {len(retests)} level retests")
 
     print("[COLLECT] Extracting features ...")
-    features = extract_features(df, htf_df, retests)
+    features = extract_features(df, htf_df, retests, htf_levels=htf_levels)
     labeled  = features.dropna(subset=["outcome"])
 
     print(f"[COLLECT] Total retests: {len(features)} | Labeled: {len(labeled)}")
@@ -461,6 +593,24 @@ def collect(symbol: str, tf_label: str, n_bars: int = 10000):
     features.to_csv(DATASET_PATH, index=False)
     print(f"[COLLECT] Saved → {DATASET_PATH}")
 
+
+
+def _make_sample_weights(df: pd.DataFrame, y: np.ndarray) -> np.ndarray:
+    """
+    Compute sample weights for XGBoost training.
+    Upweights high-confluence setups, downweights tight-overhead losses.
+    Used consistently in train(), validate(), study(), retrain() fold models
+    so that OOS evaluation uses the same training regime as production.
+    """
+    w = np.ones(len(y))
+    if "htf_any_confluence" in df.columns:
+        cm = df["htf_any_confluence"].values == 1
+        w[cm & (y == 1)] *= HTF_CONFLUENCE_WIN_WEIGHT
+        w[cm & (y == 0)] *= HTF_CONFLUENCE_LOSS_WEIGHT
+    if "overhead_resistance_tight" in df.columns:
+        om = df["overhead_resistance_tight"].values == 1
+        w[om & (y == 0)] *= HTF_OVERHEAD_LOSS_WEIGHT
+    return w
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. Train
@@ -500,7 +650,8 @@ def train(dataset_path: str = DATASET_PATH):
     scores = cross_val_score(model, X, y, cv=cv, scoring="roc_auc")
     print(f"[TRAIN] 5-fold CV AUC: {scores.mean():.4f} ± {scores.std():.4f}")
 
-    model.fit(X, y)
+    sample_weight = _make_sample_weights(df, y.values)
+    model.fit(X, y, sample_weight=sample_weight)
 
     imp = pd.Series(model.feature_importances_, index=feature_cols).sort_values(ascending=False)
     print("\n[TRAIN] Top 15 features:")
@@ -556,7 +707,8 @@ def validate(dataset_path: str = DATASET_PATH, n_splits: int = 5,
             scale_pos_weight=(y_train == 0).sum() / max(y_train.sum(), 1),
             eval_metric="logloss", random_state=42, verbosity=0,
         )
-        model.fit(X_train, y_train)
+        sw_fold = _make_sample_weights(df.iloc[:train_end], y_train)
+        model.fit(X_train, y_train, sample_weight=sw_fold)
         oos_probs[test_start:test_end] = model.predict_proba(X_test)[:, 1]
 
         w = y[test_start:test_end].sum()
@@ -630,8 +782,9 @@ def scan(symbol: str, tf_label: str, n_bars: int = 3000,
     htf = HTF_MAP.get(tf, TIMEFRAME_H4)
 
     connect()
-    df     = get_bars(symbol, tf,  n=n_bars)
-    htf_df = get_bars(symbol, htf, n=n_bars // 4)
+    df         = get_bars(symbol, tf,  n=n_bars)
+    htf_df     = get_bars(symbol, htf, n=n_bars // 4)
+    htf_levels = get_htf_levels(symbol)
     mt5.shutdown()
 
     current_price = df["close"].iloc[-1]
@@ -714,7 +867,8 @@ def scan(symbol: str, tf_label: str, n_bars: int = 3000,
             "dist_atr": dist_atr,
         })
 
-    features = extract_features(df, htf_df, retests_now, live_mode=True)
+    features = extract_features(df, htf_df, retests_now, live_mode=True,
+                                  htf_levels=htf_levels)
     if features.empty:
         print("[SCAN] Could not extract features for current levels.")
         return
@@ -1174,8 +1328,11 @@ def backtest(symbol="@MNQ", tf_label="H1", n_bars=20000,
                 return trained_models[i]
         return None
 
-    def build_feature_row(i, ts, level, sw, direction, atr_val, close):
+    def build_feature_row(i, ts, level, sw, direction, atr_val, close,
+                           _htf_levels=None):
         """Build ML feature dict for a candidate level at bar i."""
+        if _htf_levels is None:
+            _htf_levels = {"pdh":0.0,"pdl":0.0,"pwh":0.0,"pwl":0.0,"pmh":0.0,"pml":0.0}
         body       = abs(bars["close"].iloc[i] - bars["open"].iloc[i])
         bar_low    = bars["low"].iloc[i]
         bar_high   = bars["high"].iloc[i]
@@ -1276,12 +1433,18 @@ def backtest(symbol="@MNQ", tf_label="H1", n_bars=20000,
             "day_of_week":         ts.dayofweek,
             "dist_round_number":   dist_round,
             "risk_atr":            risk_proxy / atr_val if atr_val > 0 else 0,
+            **htf_features_for_level(level, atr_val, _htf_levels),
         }
 
     # ── Precompute swing lows AND highs ───────────────────────────────────────
     MIN_BAR    = max(250, SWING_LOOKBACK * 2)
     closes_arr = bars["close"].values
     highs_arr  = bars["high"].values
+
+    print("[BT] Fetching HTF key levels ...")
+    _bt_htf_levels = get_htf_levels(symbol)
+    print(f"[BT] HTF levels: PDH={_bt_htf_levels['pdh']:.0f} PDL={_bt_htf_levels['pdl']:.0f} "
+          f"PWH={_bt_htf_levels['pwh']:.0f} PWL={_bt_htf_levels['pwl']:.0f}")
 
     print("[BT] Precomputing swing lows and highs ...")
     all_lows  = find_swing_lows(bars,  lookback=SWING_LOOKBACK)
@@ -1415,7 +1578,8 @@ def backtest(symbol="@MNQ", tf_label="H1", n_bars=20000,
                 if not (0 <= dist_atr <= max_dist_atr):
                     continue
 
-                feat = build_feature_row(i, ts, level, sw, direction, atr_val, close)
+                feat = build_feature_row(i, ts, level, sw, direction, atr_val, close,
+                                           _htf_levels=_bt_htf_levels)
                 if feat is None:
                     continue
 
@@ -1708,7 +1872,8 @@ def retrain(symbol="@MNQ", tf_label="H1", n_bars=50000,
         scale_pos_weight=(y == 0).sum() / max(y.sum(), 1),
         eval_metric="logloss", random_state=42, verbosity=0,
     )
-    final_model.fit(X, y)
+    sw_retrain = _make_sample_weights(df, y.values)
+    final_model.fit(X, y, sample_weight=sw_retrain)
 
     imp = pd.Series(final_model.feature_importances_,
                     index=feature_cols).sort_values(ascending=False)
@@ -1997,6 +2162,7 @@ def ensemble(symbol="@MNQ", tf_label="H1", n_bars=3000,
     atr_s         = calc_atr(bars, ATR_PERIOD)
     atr_val       = atr_s.iloc[-1]
     current_price = bars["close"].iloc[-1]
+    _ens_htf      = get_htf_levels(symbol)
 
     # Daily trend
     daily_ema100  = calc_ema(bars["close"], 100)  # proxy on H1
@@ -2143,6 +2309,7 @@ def ensemble(symbol="@MNQ", tf_label="H1", n_bars=3000,
             "day_of_week":         ts.dayofweek,
             "dist_round_number":   dist_round,
             "risk_atr":            risk_proxy / atr_val if atr_val > 0 else 0,
+            **htf_features_for_level(level, atr_val, _ens_htf),
         }
 
         X_row  = np.array([[feat.get(c, 0) for c in feature_cols]])
@@ -2374,5 +2541,3 @@ if __name__ == "__main__":
             show_last_n=args.last_n,
             enable_short=args.short,
         )
-    elif args.mode == "study":
-        study(min_score=args.threshold)

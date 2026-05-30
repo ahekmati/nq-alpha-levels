@@ -24,9 +24,19 @@ from pathlib import Path
 # CONFIG — edit these
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Telegram
-TELEGRAM_TOKEN   = "8602513961:AAFzTS_2lSxza7soWiF3REUA6GewIgc8Grw"
-TELEGRAM_CHAT_ID = "7902956948"
+# ── CREDENTIALS — load from environment or .env file ─────────────────────────
+# On Windows VPS: set as System Environment Variables, or create a .env file
+# in the same directory with:
+#   TELEGRAM_TOKEN=your_token_here
+#   TELEGRAM_CHAT_ID=your_chat_id_here
+# Then: pip install python-dotenv  and uncomment the two lines below:
+# from dotenv import load_dotenv; load_dotenv()
+import os as _os
+TELEGRAM_TOKEN   = _os.environ.get("TELEGRAM_TOKEN",   "")
+TELEGRAM_CHAT_ID = _os.environ.get("TELEGRAM_CHAT_ID", "")
+# ── FALLBACK: hardcode here ONLY for local testing, never commit to VCS ──────
+# TELEGRAM_TOKEN   = "YOUR_TOKEN_HERE"
+# TELEGRAM_CHAT_ID = "YOUR_CHAT_ID_HERE"
 
 # Symbol
 SYMBOL_PREFIX = "MNQ"    # auto-detects front month e.g. MNQM26
@@ -45,8 +55,9 @@ CLOSE_LEVEL_ATR = 3.0   # suppress alert if nothing within 3 ATR
 DAILY_EMA_PERIOD = 100
 
 # Model + data paths
-MODEL_PATH   = "levels_xgb_model.joblib"
-DATASET_PATH = "levels_dataset.csv"
+MODEL_PATH    = "levels_xgb_model.joblib"
+ENSEMBLE_PATH = "ensemble_models.joblib"
+DATASET_PATH  = "levels_dataset.csv"
 
 # Signal history log — builds up over time
 SIGNAL_LOG_PATH  = "logs/signal_history.json"
@@ -56,12 +67,51 @@ LAST_ALERT_PATH  = "logs/last_alert.json"
 # Suppress duplicate alerts — don't re-alert same level within N hours
 SUPPRESS_HOURS   = 4
 
-# ── AUTO TRADE CONFIG ──────────────────────────────────────────────────────────
-AUTO_TRADE          = True
+# ── AUTO TRADE CONFIG ─────────────────────────────────────────────────────────
+AUTO_TRADE           = True
 AUTO_TRADE_MIN_SCORE = 0.75
-AUTO_TRADE_VOLUME   = 1.0
-AUTO_TRADE_MAGIC    = 20260002
-ORDER_STATE_PATH    = "logs/order_state.json"
+AUTO_TRADE_VOLUME    = 1.0
+AUTO_TRADE_MAGIC     = 20260002          # unique magic number — do not share with other EAs
+ORDER_EXPIRY_RUNS    = 12                # Task Scheduler runs before pending order cancelled
+                                         # 12 runs x 5 min = 60 min = 1 H1 bar
+ORDER_STATE_PATH     = "logs/order_state.json"
+
+# ── LEVEL DETECTION PARAMS ────────────────────────────────────────────────────
+SWING_LOOKBACK = 5       # bars each side to confirm a swing low
+LEVEL_ZONE_ATR = 0.30    # level zone half-width as ATR multiple
+
+# ── ORDER SIZING ──────────────────────────────────────────────────────────────
+SL_ATR = 1.0             # stop loss distance as ATR multiple
+TP_R   = 2.0             # take profit as R multiple
+
+# ── HTF PROXIMITY THRESHOLDS (must match levels_ml_win.py) ───────────────────
+HTF_CONFLUENCE_THRESH     = 0.75   # ATR multiples for support stack count
+HTF_ANY_CONFLUENCE_THRESH = 0.50   # ATR multiples for htf_any_confluence flag
+HTF_OVERHEAD_TIGHT_THRESH = 1.50   # ATR multiples for overhead resistance flag
+
+# ── TIMEFRAME CONSTANTS ───────────────────────────────────────────────────────
+TIMEFRAME_M5  = 5
+TIMEFRAME_M15 = 15
+TIMEFRAME_H1  = 16385
+TIMEFRAME_H4  = 16388
+TIMEFRAME_D1  = 16408
+TIMEFRAME_W1  = 32769
+TIMEFRAME_MN1 = 49153
+
+TIMEFRAME_MAP = {
+    "M5":  TIMEFRAME_M5,
+    "M15": TIMEFRAME_M15,
+    "H1":  TIMEFRAME_H1,
+    "H4":  TIMEFRAME_H4,
+    "D1":  TIMEFRAME_D1,
+}
+HTF_MAP = {
+    TIMEFRAME_H1:  TIMEFRAME_H4,
+    TIMEFRAME_M15: TIMEFRAME_H1,
+    TIMEFRAME_M5:  TIMEFRAME_M15,
+}
+# ── INDICATOR PARAMS ─────────────────────────────────────────────────────────
+ATR_PERIOD = 14          # ATR period used for all volatility calculations
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── Windows native MT5 ───────────────────────────────────────────────────────
@@ -84,8 +134,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("levels_alert")
 
-ATR_PERIOD     = 14
-
 
 def get_front_month_symbol(prefix: str = "MNQ") -> str:
     """
@@ -104,7 +152,7 @@ def get_front_month_symbol(prefix: str = "MNQ") -> str:
             name = sym.name
             if "@" in name or name == prefix:
                 continue
-            rates = mt5.copy_rates_from_pos(name, 16385, 0, 1)
+            rates = mt5.copy_rates_from_pos(name, TIMEFRAME_H1, 0, 1)
             if rates is not None and len(rates) > 0:
                 vol = rates[0]["tick_volume"]
                 if vol > best_vol:
@@ -117,20 +165,6 @@ def get_front_month_symbol(prefix: str = "MNQ") -> str:
         log.warning(f"Symbol detection error: {e}")
     log.warning(f"Could not detect front month — using {prefix}")
     return prefix
-SWING_LOOKBACK = 5
-LEVEL_ZONE_ATR = 0.30
-SL_ATR         = 1.0
-TP_R           = 2.0
-
-TIMEFRAME_MAP = {
-    "M5": 5, "M15": 15, "H1": 16385,
-    "H4": 16388, "D1": 16408,
-}
-HTF_MAP = {
-    16385: 16388,   # H1 → H4
-    15:    16385,   # M15 → H1
-    5:     15,      # M5 → M15
-}
 
 
 def get_bars(symbol, tf, n=500):
@@ -166,6 +200,96 @@ def calc_atr_percentile(atr_series, window=100):
     return atr_series.rolling(window).rank(pct=True)
 
 
+
+def get_htf_levels(symbol: str) -> dict:
+    """
+    Pull PDH, PDL, PWH, PWL, PMH, PML directly from MT5.
+    Uses the fully completed prior bar on each timeframe (iloc[-2]).
+    Called once per scan — 3 x 5 bars, negligible overhead.
+    """
+    empty = {"pdh": 0.0, "pdl": 0.0,
+             "pwh": 0.0, "pwl": 0.0,
+             "pmh": 0.0, "pml": 0.0}
+    try:
+        d1 = get_bars(symbol, TIMEFRAME_D1,  n=5)
+        w1 = get_bars(symbol, TIMEFRAME_W1,  n=5)
+        mn = get_bars(symbol, TIMEFRAME_MN1, n=5)
+        levels = {
+            "pdh": float(d1["high"].iloc[-2]),
+            "pdl": float(d1["low"].iloc[-2]),
+            "pwh": float(w1["high"].iloc[-2]),
+            "pwl": float(w1["low"].iloc[-2]),
+            "pmh": float(mn["high"].iloc[-2]),
+            "pml": float(mn["low"].iloc[-2]),
+        }
+        log.info(f"HTF levels — PDH:{levels['pdh']:.0f} PDL:{levels['pdl']:.0f} "
+                 f"PWH:{levels['pwh']:.0f} PWL:{levels['pwl']:.0f} "
+                 f"PMH:{levels['pmh']:.0f} PML:{levels['pml']:.0f}")
+        return levels
+    except Exception as e:
+        log.warning(f"get_htf_levels failed: {e} — using zeros")
+        return empty
+
+
+def htf_features_for_level(level: float, atr_val: float,
+                             htf_levels: dict) -> dict:
+    """
+    Identical to levels_ml_win.py — centralised HTF proximity feature set.
+    Must stay in sync with levels_ml_win.py htf_features_for_level.
+    """
+    if atr_val <= 0:
+        return {k: 0 for k in [
+            "dist_pdh", "dist_pdl", "dist_pwh", "dist_pwl",
+            "dist_pmh", "dist_pml", "htf_support_stack",
+            "dist_nearest_htf_support", "dist_nearest_htf_resistance",
+            "overhead_resistance_tight", "htf_any_confluence",
+        ]}
+
+    pdh = htf_levels.get("pdh", 0.0)
+    pdl = htf_levels.get("pdl", 0.0)
+    pwh = htf_levels.get("pwh", 0.0)
+    pwl = htf_levels.get("pwl", 0.0)
+    pmh = htf_levels.get("pmh", 0.0)
+    pml = htf_levels.get("pml", 0.0)
+
+    dist_pdh = (pdh - level) / atr_val if pdh > 0 else 99.0
+    dist_pdl = (level - pdl) / atr_val if pdl > 0 else 99.0
+    dist_pwh = (pwh - level) / atr_val if pwh > 0 else 99.0
+    dist_pwl = (level - pwl) / atr_val if pwl > 0 else 99.0
+    dist_pmh = (pmh - level) / atr_val if pmh > 0 else 99.0
+    dist_pml = (level - pml) / atr_val if pml > 0 else 99.0
+
+    htf_support_stack = sum([
+        1 for d in [dist_pdl, dist_pwl, dist_pml]
+        if abs(d) <= HTF_CONFLUENCE_THRESH
+    ])
+
+    support_dists = [d for d in [dist_pdl, dist_pwl, dist_pml] if 0 <= d]
+    dist_nearest_htf_support = min(support_dists) if support_dists else 99.0
+
+    resist_dists = [d for d in [dist_pdh, dist_pwh, dist_pmh] if 0 < d]
+    dist_nearest_htf_resistance = min(resist_dists) if resist_dists else 99.0
+
+    overhead_resistance_tight = int(dist_nearest_htf_resistance < HTF_OVERHEAD_TIGHT_THRESH)
+    htf_any_confluence = int(any(
+        abs(d) <= HTF_ANY_CONFLUENCE_THRESH for d in [dist_pdl, dist_pwl, dist_pml]
+    ))
+
+    return {
+        "dist_pdh":                    dist_pdh,
+        "dist_pdl":                    dist_pdl,
+        "dist_pwh":                    dist_pwh,
+        "dist_pwl":                    dist_pwl,
+        "dist_pmh":                    dist_pmh,
+        "dist_pml":                    dist_pml,
+        "htf_support_stack":           htf_support_stack,
+        "dist_nearest_htf_support":    dist_nearest_htf_support,
+        "dist_nearest_htf_resistance": dist_nearest_htf_resistance,
+        "overhead_resistance_tight":   overhead_resistance_tight,
+        "htf_any_confluence":          htf_any_confluence,
+    }
+
+
 def find_swing_lows(df):
     lows     = df["low"].values
     atr_vals = calc_atr(df).values
@@ -186,7 +310,7 @@ def find_swing_lows(df):
 def get_daily_trend(symbol):
     """Returns trend string and values for display."""
     try:
-        daily    = get_bars(symbol, 16408, n=150)
+        daily    = get_bars(symbol, TIMEFRAME_D1, n=150)
         ema100   = calc_ema(daily["close"], DAILY_EMA_PERIOD)
         last_c   = daily["close"].iloc[-1]
         last_e   = ema100.iloc[-1]
@@ -244,7 +368,10 @@ def get_active_levels(bars, current_price, atr_val):
     return sorted(active, key=lambda x: x["dist_atr"])
 
 
-def build_feature_row(bars, htf_bars, level_info, feat_cols):
+def build_feature_row(bars, htf_bars, level_info, feat_cols,
+                       htf_levels=None):
+    if htf_levels is None:
+        htf_levels = {"pdh":0.0,"pdl":0.0,"pwh":0.0,"pwl":0.0,"pmh":0.0,"pml":0.0}
     i       = len(bars) - 1
     ts      = bars.index[i]
     close   = bars["close"].iloc[i]
@@ -337,6 +464,7 @@ def build_feature_row(bars, htf_bars, level_info, feat_cols):
         "day_of_week":         ts.dayofweek,
         "dist_round_number":   dist_round,
         "risk_atr":            risk_proxy / atr_val,
+        **htf_features_for_level(level, atr_val, htf_levels),
     }
 
     return np.array([[feat.get(c, 0) for c in feat_cols]])
@@ -492,7 +620,9 @@ def any_pending_order_exists(symbol: str) -> bool:
     try:
         orders = mt5.orders_get(symbol=symbol)
         if orders is None:
-            return False
+            # MT5 error — treat conservatively as order may exist
+            log.warning(f"orders_get() returned None: {mt5.last_error()} — treating as pending exists")
+            return True
         bot_orders = [o for o in orders if o.magic == AUTO_TRADE_MAGIC]
         if bot_orders:
             log.info(f"Pending bot order exists for {symbol} — skipping")
@@ -512,7 +642,7 @@ def load_order_state() -> dict:
             pass
     return {"pending_ticket": None, "placed_at": None,
             "level": None, "sl": None, "tp": None,
-            "bars_since_placed": 0}
+            "runs_since_placed": 0}
 
 
 def save_order_state(state: dict):
@@ -523,7 +653,7 @@ def save_order_state(state: dict):
 def clear_order_state():
     save_order_state({"pending_ticket": None, "placed_at": None,
                       "level": None, "sl": None, "tp": None,
-                      "bars_since_placed": 0})
+                      "runs_since_placed": 0})
 
 
 def check_and_cleanup_pending(symbol: str) -> bool:
@@ -538,11 +668,16 @@ def check_and_cleanup_pending(symbol: str) -> bool:
         return False
 
     ticket = state["pending_ticket"]
-    state["bars_since_placed"] = state.get("bars_since_placed", 0) + 1
 
-    # Check if order still exists
+    # Check if order still exists — query MT5 first before modifying state
     orders = mt5.orders_get(symbol=symbol)
-    tickets = [o.ticket for o in orders] if orders else []
+    if orders is None:
+        # MT5 query failed — treat conservatively, keep state, try next run
+        log.warning(f"orders_get() returned None for {symbol}: {mt5.last_error()} "
+                    f"— keeping order state, will retry next run")
+        return True
+
+    tickets = [o.ticket for o in orders]
 
     if ticket not in tickets:
         # Order gone — either filled or externally cancelled
@@ -555,30 +690,38 @@ def check_and_cleanup_pending(symbol: str) -> bool:
         clear_order_state()
         return False
 
-    # Order still pending — check expiry
-    if state["bars_since_placed"] >= 3:
-        log.info(f"⏰ Order #{ticket} expired after 3 bars — cancelling")
+    # Order confirmed still pending — safe to increment counter
+    state["runs_since_placed"] = state.get("runs_since_placed", 0) + 1
+
+    # Order still pending — check expiry (ORDER_EXPIRY_RUNS = ~1 H1 bar at 5-min schedule)
+    if state["runs_since_placed"] >= ORDER_EXPIRY_RUNS:
+        log.info(f"⏰ Order #{ticket} expired after {ORDER_EXPIRY_RUNS} runs — cancelling")
         req = {"action": mt5.TRADE_ACTION_REMOVE, "order": ticket}
-        result = mt5.order_send(req)
-        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+        try:
+            result = mt5.order_send(req)
+        except Exception as _ce:
+            log.warning(f"Cancel exception for #{ticket}: {_ce}")
+            result = None
+        if result is None:
+            log.warning(f"Cancel order_send returned None for #{ticket}: {mt5.last_error()}")
+        elif result.retcode == mt5.TRADE_RETCODE_DONE:
             log.info(f"Order #{ticket} cancelled successfully")
             send_telegram(f"⏰ Limit order #{ticket} expired unfilled — cancelled")
         else:
-            log.warning(f"Cancel failed for #{ticket}: "
-                        f"{result.retcode if result else 'no result'}")
+            log.warning(f"Cancel failed for #{ticket}: retcode={result.retcode}")
         clear_order_state()
         return False
 
     save_order_state(state)
     log.info(f"Pending order #{ticket} still active "
-             f"({state['bars_since_placed']}/3 bars)")
+             f"({state['runs_since_placed']}/{ORDER_EXPIRY_RUNS} runs)")
     return True
 
 
-def place_limit_order_mt5linux(symbol: str, level: float,
-                                sl: float, tp: float) -> int:
+def place_limit_order(symbol: str, level: float,
+                       sl: float, tp: float) -> int:
     """
-    Place a buy limit order via mt5linux.
+    Place a buy limit order via MT5 (Windows native).
     Returns ticket number on success, -1 on failure.
 
     FINAL GATE: checks for open positions one last time immediately
@@ -624,7 +767,7 @@ def place_limit_order_mt5linux(symbol: str, level: float,
         "magic":         AUTO_TRADE_MAGIC,
         "comment":       "nq_alpha_bot",
         "type_time":     mt5.ORDER_TIME_GTC,
-        "type_filling":  mt5.ORDER_FILLING_IOC,
+        "type_filling":  mt5.ORDER_FILLING_RETURN,  # correct policy for pending limit orders at AMP
     }
 
     log.info(f"Placing limit order: {symbol} BUY LIMIT @ {price_r} "
@@ -648,7 +791,7 @@ def place_limit_order_mt5linux(symbol: str, level: float,
 
 
 def send_telegram(message: str) -> bool:
-    if TELEGRAM_TOKEN == "YOUR_BOT_TOKEN_HERE":
+    if not TELEGRAM_TOKEN or len(TELEGRAM_TOKEN) < 20:
         log.warning("Telegram not configured — printing to console only")
         print("\n" + "=" * 50)
         print(message)
@@ -706,15 +849,20 @@ def format_alert(strong_levels, watch_levels, trend_info,
             else:
                 consensus_str = ""
                 score_detail  = f"score {lv['score']:.0%}"
+            stack = lv.get("htf_support_stack", 0)
+            conf_tag = (" 🏆TRIPLE" if stack >= 3 else
+                        " ⭐DOUBLE" if stack == 2 else
+                        " ✦CONF" if stack == 1 else "")
+            overhead_tag = " ⚠️OHR" if lv.get("overhead_resistance_tight", 0) else ""
             lines.append(
-                f"  📍 <b>{lv['level']:,.2f}</b> | avg {lv['score']:.0%}"
-                f"{consensus_str} | {lv['dist_atr']:.1f} ATR | "
-                f"{lv['touch_count']} touches | age {lv['age_bars']}bars"
+                f"  📍 <b>{lv['price']:,.2f}</b> | avg {lv['score']:.0%}"
+                f"{consensus_str}{conf_tag}{overhead_tag} | {lv['dist_atr']:.1f} ATR | "
+                f"{lv['touch_count']} touches | age {lv.get('age_bars', '?')}bars"
             )
             if ens:
                 lines.append(f"     {score_detail}")
             lines.append(
-                f"     Entry: {lv['level']:,.2f}  SL: {sl:,.2f}  TP: {tp:,.2f}"
+                f"     Entry: {lv['price']:,.2f}  SL: {sl:,.2f}  TP: {tp:,.2f}"
             )
             lines.append(
                 f"     Risk: {rsk:.0f}pts (${rsk*2:.0f})  "
@@ -735,13 +883,16 @@ def format_alert(strong_levels, watch_levels, trend_info,
                 consensus_str = f" | [{bar}] {n_a}/{n_m}"
             else:
                 consensus_str = ""
+            w_stack = lv.get("htf_support_stack", 0)
+            w_conf = (" ⭐DOUBLE" if w_stack >= 2 else " ✦CONF" if w_stack == 1 else "")
+            w_ohr = " ⚠️OHR" if lv.get("overhead_resistance_tight", 0) else ""
             lines.append(
-                f"  📍 {lv['level']:,.2f} | avg {lv['score']:.0%}"
-                f"{consensus_str} | {lv['dist_atr']:.1f} ATR | "
+                f"  📍 {lv['price']:,.2f} | avg {lv['score']:.0%}"
+                f"{consensus_str}{w_conf}{w_ohr} | {lv['dist_atr']:.1f} ATR | "
                 f"{lv['touch_count']} touches"
             )
             lines.append(
-                f"     Entry: {lv['level']:,.2f}  SL: {sl:,.2f}  TP: {tp:,.2f}"
+                f"     Entry: {lv['price']:,.2f}  SL: {sl:,.2f}  TP: {tp:,.2f}"
             )
         lines.append("")
 
@@ -795,8 +946,7 @@ def main():
     model     = saved["model"]
     feat_cols = saved["features"]
 
-    # Load ensemble models if available
-    ENSEMBLE_PATH = "ensemble_models.joblib"
+    # Load ensemble models if available (path defined in config)
     ensemble_data = None
     if os.path.exists(ENSEMBLE_PATH):
         try:
@@ -821,29 +971,31 @@ def main():
         log.info(f"Symbol: {symbol}")
 
         # ── GATE 1: Check for open positions BEFORE doing anything else ───────
-        # This is the outermost guard — if anything is open we don't even
-        # scan for levels. Saves processing and prevents any race condition.
-        if AUTO_TRADE and any_position_open():
-            log.info("AUTO_TRADE: position open in terminal — skipping scan entirely")
+        # Outermost guard — skip entire scan if any position is open.
+        # Runs regardless of AUTO_TRADE so alerts are never sent into a live position.
+        if any_position_open():
+            log.info("GATE 1: position open in terminal — skipping scan entirely")
             mt5.shutdown()
             log.info("=== SCAN END — position open, no scan ===\n")
             return
 
-        # ── GATE 2: Check if we have a pending order still waiting ───────────
-        if AUTO_TRADE:
-            has_pending = check_and_cleanup_pending(symbol)
-            if has_pending:
-                log.info("AUTO_TRADE: pending order still active — skipping scan")
-                mt5.shutdown()
-                log.info("=== SCAN END — pending order exists ===\n")
-                return
+        # ── GATE 2: Check + cleanup pending order state (always runs) ─────────
+        # Even when AUTO_TRADE=False we clean up stale order_state.json
+        # so it does not block future runs when AUTO_TRADE is re-enabled.
+        has_pending = check_and_cleanup_pending(symbol)
+        if has_pending and AUTO_TRADE:
+            log.info("GATE 2: pending order still active — skipping scan")
+            mt5.shutdown()
+            log.info("=== SCAN END — pending order exists ===\n")
+            return
 
         tf  = TIMEFRAME_MAP[TF_LABEL]
-        htf = HTF_MAP.get(tf, 16388)
+        htf = HTF_MAP.get(tf, TIMEFRAME_H4)
 
         # ── Pull bars ─────────────────────────────────────────────────────────
-        bars     = get_bars(symbol, tf,  n=600)
-        htf_bars = get_bars(symbol, htf, n=200)
+        bars       = get_bars(symbol, tf,  n=600)
+        htf_bars   = get_bars(symbol, htf, n=200)
+        htf_levels = get_htf_levels(symbol)
 
         current_price = bars["close"].iloc[-1]
         atr_val       = calc_atr(bars).iloc[-1]
@@ -864,11 +1016,21 @@ def main():
 
         for lv in levels:
             try:
-                X = build_feature_row(bars, htf_bars, lv, feat_cols)
+                X = build_feature_row(bars, htf_bars, lv, feat_cols,
+                                       htf_levels=htf_levels)
                 if X is None:
                     continue
                 score = float(model.predict_proba(X)[0, 1])
                 lv["score"] = score
+
+                # Store HTF features on lv for alert formatting — single call
+                try:
+                    _hf = htf_features_for_level(lv["price"], atr_val, htf_levels)
+                    lv["htf_support_stack"]        = int(_hf.get("htf_support_stack", 0))
+                    lv["overhead_resistance_tight"] = int(_hf.get("overhead_resistance_tight", 0))
+                except Exception:
+                    lv["htf_support_stack"]        = 0
+                    lv["overhead_resistance_tight"] = 0
 
                 log.info(f"  Level {lv['price']:,.2f} | "
                          f"dist={lv['dist_atr']:.2f} ATR | "
@@ -910,8 +1072,9 @@ def main():
             log.info("=== SCAN END — bearish trend, no alert ===\n")
             return
 
-        # ── Log signals to history ────────────────────────────────────────────
-        for lv in strong_levels + watch_levels:
+        # ── Log signals to history — STRONG only (these are the auto-traded signals)
+        # WATCH levels are still alerted via Telegram but not logged to history
+        for lv in strong_levels:
             sl = lv["price"] - SL_ATR * atr_val
             tp = lv["price"] + TP_R * abs(lv["price"] - sl)
             log_signal(
@@ -925,6 +1088,8 @@ def main():
                 atr_val      = atr_val,
                 trend_label  = trend_info["label"],
             )
+        # Mark all alerted levels (both strong and watch) for duplicate suppression
+        for lv in strong_levels + watch_levels:
             last_alert = mark_alerted(lv["price"], lv["score"],
                                       last_alert, atr_val)
 
@@ -961,14 +1126,14 @@ def main():
                     send_telegram(
                         f"⚠️ Auto-trade aborted\n"
                         f"Position detected before order placement\n"
-                        f"Level {best['level']:,.2f} — check manually"
+                        f"Level {best['price']:,.2f} — check manually"
                     )
                 else:
                     sl     = best["price"] - SL_ATR * atr_val
                     tp     = best["price"] + TP_R * abs(best["price"] - sl)
                     risk   = abs(best["price"] - sl)
 
-                    ticket = place_limit_order_mt5linux(
+                    ticket = place_limit_order(
                         symbol = symbol,
                         level  = best["price"],
                         sl     = sl,
@@ -983,25 +1148,25 @@ def main():
                             "level":             best["price"],
                             "sl":                sl,
                             "tp":                tp,
-                            "bars_since_placed": 0,
+                            "runs_since_placed": 0,
                         })
 
                         order_msg = (
                             f"\n✅ <b>LIMIT ORDER PLACED</b>\n"
                             f"   Ticket: #{ticket}\n"
-                            f"   Entry : {best['level']:,.2f}\n"
+                            f"   Entry : {best['price']:,.2f}\n"
                             f"   SL    : {sl:,.2f}  ({risk:.0f}pts / ${risk*2:.0f})\n"
                             f"   TP    : {tp:,.2f}  ({risk*TP_R:.0f}pts / ${risk*TP_R*2:.0f})\n"
-                            f"   Status: Waiting for fill (expires in 3 bars)"
+                            f"   Status: Waiting for fill (expires in ~{ORDER_EXPIRY_RUNS} runs / 1 H1 bar)"
                         )
                         send_telegram(order_msg)
-                        log.info(f"AUTO_TRADE: order placed #{ticket} @ {best['level']:.2f}")
+                        log.info(f"AUTO_TRADE: order placed #{ticket} @ {best['price']:.2f}")
 
                     else:
                         log.error("AUTO_TRADE: order_send failed")
                         send_telegram(
                             f"❌ Auto-trade order FAILED\n"
-                            f"Level {best['level']:,.2f} — place manually"
+                            f"Level {best['price']:,.2f} — place manually"
                         )
             else:
                 log.info(f"AUTO_TRADE: best score {best['score']:.1%} < "
