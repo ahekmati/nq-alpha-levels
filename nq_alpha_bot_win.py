@@ -19,6 +19,11 @@ import pandas as pd
 import joblib
 from datetime import datetime, timezone
 from pathlib import Path
+# ── Windows console UTF-8 fix (emoji in log output) ──────────────────────────
+import sys
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG — edit these
