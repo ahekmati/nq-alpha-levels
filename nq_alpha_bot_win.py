@@ -324,11 +324,11 @@ def get_daily_trend(symbol):
             "bullish":   bullish,
             "close":     last_c,
             "ema100":    last_e,
-            "label":     "BULLISH ✅" if bullish else "BEARISH ❌",
+            "label":     "BULLISH [OK]" if bullish else "BEARISH [--]",
         }
     except Exception as e:
         log.warning(f"Daily trend error: {e}")
-        return {"bullish": None, "close": 0, "ema100": 0, "label": "UNKNOWN ⚠️"}
+        return {"bullish": None, "close": 0, "ema100": 0, "label": "UNKNOWN [??]"}
 
 
 def get_active_levels(bars, current_price, atr_val):
@@ -689,7 +689,7 @@ def check_and_cleanup_pending(symbol: str) -> bool:
         positions = mt5.positions_get(symbol=symbol)
         filled = [p for p in (positions or []) if p.magic == AUTO_TRADE_MAGIC]
         if filled:
-            log.info(f"✅ Order #{ticket} filled → position open")
+            log.info(f"[FILLED] Order #{ticket} filled → position open")
         else:
             log.info(f"Order #{ticket} no longer pending (cancelled/expired)")
         clear_order_state()
@@ -700,7 +700,7 @@ def check_and_cleanup_pending(symbol: str) -> bool:
 
     # Order still pending — check expiry (ORDER_EXPIRY_RUNS = ~1 H1 bar at 5-min schedule)
     if state["runs_since_placed"] >= ORDER_EXPIRY_RUNS:
-        log.info(f"⏰ Order #{ticket} expired after {ORDER_EXPIRY_RUNS} runs — cancelling")
+        log.info(f"[EXPIRED] Order #{ticket} expired after {ORDER_EXPIRY_RUNS} runs — cancelling")
         req = {"action": mt5.TRADE_ACTION_REMOVE, "order": ticket}
         try:
             result = mt5.order_send(req)
@@ -711,7 +711,7 @@ def check_and_cleanup_pending(symbol: str) -> bool:
             log.warning(f"Cancel order_send returned None for #{ticket}: {mt5.last_error()}")
         elif result.retcode == mt5.TRADE_RETCODE_DONE:
             log.info(f"Order #{ticket} cancelled successfully")
-            send_telegram(f"⏰ Limit order #{ticket} expired unfilled — cancelled")
+            send_telegram(f"[EXPIRED] Limit order #{ticket} expired unfilled — cancelled")
         else:
             log.warning(f"Cancel failed for #{ticket}: retcode={result.retcode}")
         clear_order_state()
@@ -1048,7 +1048,7 @@ def main():
 
                 # Check duplicate suppression
                 if is_duplicate(lv["price"], score, last_alert, atr_val):
-                    log.info(f"  → suppressed (alerted recently)")
+                    log.info(f"  -> suppressed (alerted recently)")
                     continue
 
                 if score >= SCORE_STRONG:
