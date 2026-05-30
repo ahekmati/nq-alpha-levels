@@ -624,9 +624,10 @@ def any_position_open() -> bool:
 
 
 def any_pending_order_exists(symbol: str) -> bool:
-    """Check if a bot-placed pending order already exists for this symbol."""
+    """Check if a bot-placed pending order already exists (checks all symbols
+    so a contract roll does not bypass this gate)."""
     try:
-        orders = mt5.orders_get(symbol=symbol)
+        orders = mt5.orders_get()  # no symbol filter — catches rolled contracts
         if orders is None:
             # MT5 error — treat conservatively as order may exist
             log.warning(f"orders_get() returned None: {mt5.last_error()} — treating as pending exists")
@@ -677,11 +678,12 @@ def check_and_cleanup_pending(symbol: str) -> bool:
 
     ticket = state["pending_ticket"]
 
-    # Check if order still exists — query MT5 first before modifying state
-    orders = mt5.orders_get(symbol=symbol)
+    # Check if order still exists — query ALL pending orders (no symbol filter)
+    # so a contract roll (MNQM26 → MNQU26) does not cause us to lose track of the order
+    orders = mt5.orders_get()
     if orders is None:
         # MT5 query failed — treat conservatively, keep state, try next run
-        log.warning(f"orders_get() returned None for {symbol}: {mt5.last_error()} "
+        log.warning(f"orders_get() returned None: {mt5.last_error()} "
                     f"— keeping order state, will retry next run")
         return True
 
@@ -710,33 +712,49 @@ def check_and_cleanup_pending(symbol: str) -> bool:
     placed_date      = placed_at.date()
     today            = now_utc.date()
     past_ny_close    = now_utc.hour >= NY_SESSION_END_UTC
-    session_expired  = (placed_date == today and past_ny_close) or                        (placed_date < today)   # order from a previous day — always cancel
+    days_since_placed = (today - placed_date).days
+    # Keep order alive for current session + one more session (2-day hard max)
+    # Day 0 (placed today)   → expires at 21:00 UTC today
+    # Day 1 (placed yesterday) → expires at 21:00 UTC today
+    # Day 2+ → always cancel regardless of time
+    session_expired  = (days_since_placed <= 1 and past_ny_close) or \
+                       (days_since_placed >= 2)   # hard 2-day max
     run_backstop     = state["runs_since_placed"] >= ORDER_EXPIRY_RUNS
 
     if session_expired or run_backstop:
-        reason = "NY session closed (21:00 UTC)" if session_expired else                  f"run backstop ({ORDER_EXPIRY_RUNS} runs)"
-        log.info(f"[EXPIRED] Order #{ticket} cancelled — {reason}")
+        reason = "NY session closed (21:00 UTC)" if session_expired else \
+                 f"run backstop ({ORDER_EXPIRY_RUNS} runs)"
+        log.info(f"[EXPIRED] Attempting to cancel order #{ticket} — {reason}")
         req = {"action": mt5.TRADE_ACTION_REMOVE, "order": ticket}
         try:
             result = mt5.order_send(req)
         except Exception as _ce:
             log.warning(f"Cancel exception for #{ticket}: {_ce}")
             result = None
+
         if result is None:
-            log.warning(f"Cancel order_send returned None for #{ticket}: {mt5.last_error()}")
+            # MT5 error — do NOT clear state, retry cancel next run
+            log.warning(f"Cancel order_send returned None for #{ticket}: {mt5.last_error()} "
+                        f"— keeping state, will retry cancel next run")
+            save_order_state(state)
+            return True
         elif result.retcode == mt5.TRADE_RETCODE_DONE:
-            log.info(f"Order #{ticket} cancelled successfully")
+            log.info(f"Order #{ticket} cancelled successfully — {reason}")
             send_telegram(f"[EXPIRED] Limit order #{ticket} cancelled — {reason}")
+            clear_order_state()
+            return False
         else:
-            log.warning(f"Cancel failed for #{ticket}: retcode={result.retcode}")
-        clear_order_state()
-        return False
+            # Cancel rejected by broker — keep state and retry next run
+            log.warning(f"Cancel rejected for #{ticket}: retcode={result.retcode} "
+                        f"— will retry next run")
+            save_order_state(state)
+            return True
 
     save_order_state(state)
-    now_utc = datetime.now(timezone.utc)
-    hrs_to_close = max(0, NY_SESSION_END_UTC - now_utc.hour)
+    now_utc_log   = datetime.now(timezone.utc)
+    hrs_to_close  = max(0, NY_SESSION_END_UTC - now_utc_log.hour)
     log.info(f"Pending order #{ticket} still active | "
-             f"run {state['runs_since_placed']} | "
+             f"day {days_since_placed}/1 | run {state['runs_since_placed']} | "
              f"NY close in ~{hrs_to_close}h ({NY_SESSION_END_UTC}:00 UTC)")
     return True
 
