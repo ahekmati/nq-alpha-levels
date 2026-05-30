@@ -78,6 +78,15 @@ ORDER_EXPIRY_RUNS    = 252              # Hard backstop — 252 runs x 5 min = 2
                                          # catches edge case of order placed just before session end
 ORDER_STATE_PATH     = "logs/order_state.json"
 
+# ── DAILY TRADE GUARDS ────────────────────────────────────────────────────────
+# ONE_LOSS_PER_DAY: if True, bot stops trading for the rest of the day after
+# one filled order that was stopped out.  Wins do NOT count — only losses.
+ONE_LOSS_PER_DAY     = True
+# LEVEL_COOLDOWN_TODAY: if True, a level that was already traded today (win OR
+# loss) will not be re-entered, regardless of ONE_LOSS_PER_DAY.
+LEVEL_COOLDOWN_TODAY = True
+DAILY_STATE_PATH     = "logs/daily_state.json"
+
 # ── LEVEL DETECTION PARAMS ────────────────────────────────────────────────────
 SWING_LOOKBACK = 5       # bars each side to confirm a swing low
 LEVEL_ZONE_ATR = 0.30    # level zone half-width as ATR multiple
@@ -132,11 +141,18 @@ _log_fmt = logging.Formatter(
 )
 _stream_handler = logging.StreamHandler()
 _stream_handler.setFormatter(_log_fmt)
-# Wrap stdout in utf-8 to handle emoji characters on Windows cp1252 consoles
+# Wrap stdout in utf-8 to handle emoji on Windows cp1252 consoles.
+# Guard with hasattr — Task Scheduler / redirected stdout may not expose .buffer,
+# and wrapping a non-buffered stream raises AttributeError at startup.
 import io as _io
-_stream_handler.stream = _io.TextIOWrapper(
-    _stream_handler.stream.buffer, encoding="utf-8", errors="replace", line_buffering=True
-)
+try:
+    if hasattr(_stream_handler.stream, "buffer"):
+        _stream_handler.stream = _io.TextIOWrapper(
+            _stream_handler.stream.buffer,
+            encoding="utf-8", errors="replace", line_buffering=True,
+        )
+except Exception:
+    pass  # leave stream as-is — logging still works, just may lose emoji on console
 _file_handler = logging.FileHandler(SCAN_LOG_PATH, encoding="utf-8")
 _file_handler.setFormatter(_log_fmt)
 logging.basicConfig(level=logging.INFO, handlers=[_stream_handler, _file_handler])
@@ -541,17 +557,34 @@ def save_last_alert(alerted_levels: dict):
         json.dump(alerted_levels, f, indent=2)
 
 
+def _level_key(level_price: float) -> str:
+    """
+    Stable zone key for duplicate suppression.
+    Uses a fixed 25-point bucket (~ half a typical MNQ ATR zone) instead of
+    dividing by live ATR — ATR fluctuates, which would cause the same level to
+    hash to different keys across runs and bypass suppression.
+    25 pts chosen so adjacent levels that are clearly the same zone collapse
+    to one key, while levels 50+ pts apart stay distinct.
+    """
+    return str(int(round(level_price / 25)))
+
+
 def is_duplicate(level_price: float, score: float,
                  last_alert: dict, atr_val: float) -> bool:
     """
     Suppress re-alerting the same level within SUPPRESS_HOURS
     unless score has improved by more than 5%.
     """
-    key = str(round(level_price / (atr_val * LEVEL_ZONE_ATR)))
+    key = _level_key(level_price)
     if key not in last_alert:
         return False
-    prev      = last_alert[key]
-    prev_time = datetime.fromisoformat(prev["timestamp"])
+    prev = last_alert[key]
+    try:
+        prev_time = datetime.fromisoformat(prev["timestamp"])
+        if prev_time.tzinfo is None:
+            prev_time = prev_time.replace(tzinfo=timezone.utc)
+    except (KeyError, ValueError):
+        return False   # corrupt timestamp — allow alert through
     now       = datetime.now(timezone.utc)
     hours_ago = (now - prev_time).total_seconds() / 3600
     if hours_ago < SUPPRESS_HOURS:
@@ -561,7 +594,7 @@ def is_duplicate(level_price: float, score: float,
 
 
 def mark_alerted(level_price, score, last_alert, atr_val):
-    key = str(round(level_price / (atr_val * LEVEL_ZONE_ATR)))
+    key = _level_key(level_price)
     last_alert[key] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "score":     score,
@@ -651,10 +684,11 @@ def load_order_state() -> dict:
             pass
     return {"pending_ticket": None, "placed_at": None,
             "level": None, "sl": None, "tp": None,
-            "runs_since_placed": 0}
+            "runs_since_placed": 0, "filled_at": None}
 
 
 def save_order_state(state: dict):
+    os.makedirs(os.path.dirname(ORDER_STATE_PATH), exist_ok=True)
     with open(ORDER_STATE_PATH, "w") as f:
         json.dump(state, f, indent=2, default=str)
 
@@ -662,14 +696,152 @@ def save_order_state(state: dict):
 def clear_order_state():
     save_order_state({"pending_ticket": None, "placed_at": None,
                       "level": None, "sl": None, "tp": None,
-                      "runs_since_placed": 0})
+                      "runs_since_placed": 0, "filled_at": None})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DAILY STATE — tracks losses and traded levels within the current calendar day
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _today_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def load_daily_state() -> dict:
+    """Load today's daily state, or return a fresh state if it's a new day."""
+    today = _today_utc()
+    if os.path.exists(DAILY_STATE_PATH):
+        try:
+            with open(DAILY_STATE_PATH) as f:
+                state = json.load(f)
+            if state.get("date") == today:
+                return state
+        except Exception:
+            pass
+    # New day or corrupt — return clean slate
+    return {"date": today, "losses_today": 0, "traded_levels": []}
+
+
+def save_daily_state(state: dict):
+    os.makedirs(os.path.dirname(DAILY_STATE_PATH), exist_ok=True)
+    with open(DAILY_STATE_PATH, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def record_daily_loss():
+    """Call when a filled order is confirmed stopped out."""
+    state = load_daily_state()
+    state["losses_today"] = state.get("losses_today", 0) + 1
+    save_daily_state(state)
+    log.info(f"DAILY STATE: losses_today={state['losses_today']}")
+
+
+def record_daily_traded_level(level_price: float, atr_val: float):
+    """Mark a level as traded today so it won't be re-entered."""
+    state = load_daily_state()
+    levels = state.get("traded_levels", [])
+    levels.append({"level": round(level_price, 2), "atr": round(atr_val, 2)})
+    state["traded_levels"] = levels
+    save_daily_state(state)
+    log.info(f"DAILY STATE: recorded traded level {level_price:.2f} "
+             f"(total traded today: {len(levels)})")
+
+
+def daily_loss_limit_reached() -> bool:
+    """Returns True if ONE_LOSS_PER_DAY is enabled and a loss has occurred today."""
+    if not ONE_LOSS_PER_DAY:
+        return False
+    state = load_daily_state()
+    reached = state.get("losses_today", 0) >= 1
+    if reached:
+        log.info(f"DAILY GUARD: loss limit reached ({state['losses_today']} "
+                 f"loss(es) today) — no new orders")
+    return reached
+
+
+def level_traded_today(level_price: float, atr_val: float) -> bool:
+    """Returns True if this level (within LEVEL_ZONE_ATR) was already traded today.
+    Uses the ATR recorded at trade time for the zone check, not the current live ATR,
+    so the cooldown zone stays consistent regardless of intraday volatility shifts.
+    Falls back to current atr_val if no recorded ATR exists."""
+    if not LEVEL_COOLDOWN_TODAY:
+        return False
+    state = load_daily_state()
+    for entry in state.get("traded_levels", []):
+        recorded_atr = entry.get("atr")
+        if recorded_atr is None or recorded_atr <= 0:
+            recorded_atr = atr_val   # fallback to current ATR if not recorded or degenerate
+        zone = LEVEL_ZONE_ATR * recorded_atr
+        if abs(entry["level"] - level_price) <= zone:
+            log.info(f"DAILY GUARD: level {level_price:.2f} already traded today "
+                     f"(recorded as {entry['level']:.2f}, zone ±{zone:.1f}pts) — skipping")
+            return True
+    return False
+
+
+def check_and_update_order_outcome(symbol: str, atr_val: float):
+    """
+    Called at the start of each run BEFORE Gate 1.
+    Detects if a previously filled order has now been closed (SL or TP hit)
+    and updates daily state accordingly.
+    Reads from order_state.json — only acts if we have a recorded filled level.
+    """
+    state = load_order_state()
+    level = state.get("level")
+    filled_at = state.get("filled_at")   # set when fill is detected (see below)
+
+    if level is None or filled_at is None:
+        return  # no filled order to track
+
+    # Check if position is still open
+    positions = mt5.positions_get()
+    bot_positions = [p for p in (positions or [])
+                     if p.magic == AUTO_TRADE_MAGIC]
+
+    if bot_positions:
+        return  # still in trade, nothing to do yet
+
+    # Position gone — trade closed (SL or TP)
+    # Determine outcome by checking deal history for last closed deal
+    outcome = "unknown"
+    try:
+        try:
+            from_dt = datetime.fromisoformat(filled_at)
+        except (ValueError, TypeError):
+            log.warning(f"Invalid filled_at timestamp '{filled_at}' — falling back to today 00:00 UTC")
+            from_dt = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0)
+        if from_dt.tzinfo is None:
+            from_dt = from_dt.replace(tzinfo=timezone.utc)
+        deals = mt5.history_deals_get(from_dt, datetime.now(timezone.utc))
+        if deals:
+            bot_deals = [d for d in deals if d.magic == AUTO_TRADE_MAGIC
+                         and d.entry == mt5.DEAL_ENTRY_OUT]   # DEAL_ENTRY_OUT = closing deal
+            if bot_deals:
+                last = sorted(bot_deals, key=lambda d: d.time)[-1]
+                outcome = "win" if last.profit > 0 else "loss"
+    except Exception as e:
+        log.warning(f"Outcome detection error: {e}")
+
+    log.info(f"OUTCOME DETECTED: level {level:.2f} closed as {outcome}")
+
+    # Record traded level regardless of outcome
+    record_daily_traded_level(level, atr_val)
+
+    # Record loss for daily limit
+    if outcome == "loss":
+        record_daily_loss()
+
+    # Clear filled_at from order state so we don't re-process
+    state["filled_at"] = None
+    state["level"]     = None
+    save_order_state(state)
 
 
 def check_and_cleanup_pending(symbol: str) -> bool:
     """
     Check if our previously placed order is still pending.
     If it filled → clear state, return False (no pending).
-    If it expired (>3 bars) → cancel it, clear state, return False.
+    If it expired (past NY close 21:00 UTC, or 2-day hard max, or ORDER_EXPIRY_RUNS backstop) → cancel it, clear state, return False.
     Returns True if order is still pending and valid.
     """
     state = load_order_state()
@@ -690,28 +862,38 @@ def check_and_cleanup_pending(symbol: str) -> bool:
     tickets = [o.ticket for o in orders]
 
     if ticket not in tickets:
-        # Order gone — either filled or externally cancelled
-        positions = mt5.positions_get(symbol=symbol)
-        filled = [p for p in (positions or []) if p.magic == AUTO_TRADE_MAGIC]
+        # Order gone — either filled or externally cancelled.
+        # Search ALL positions by magic (not by symbol) so a contract roll
+        # e.g. MNQM26 → MNQU26 does not cause us to miss a filled position.
+        all_positions = mt5.positions_get()
+        filled = [p for p in (all_positions or []) if p.magic == AUTO_TRADE_MAGIC]
         if filled:
-            log.info(f"✅ Order #{ticket} filled → position open")
+            log.info(f"✅ Order #{ticket} filled → position open — tracking for outcome")
+            # Keep level + record fill time so check_and_update_order_outcome
+            # can detect SL/TP close and update daily state
+            state["filled_at"]      = datetime.now(timezone.utc).isoformat()
+            state["pending_ticket"] = None   # order is gone, position is open
+            save_order_state(state)
         else:
             log.info(f"Order #{ticket} no longer pending (cancelled/expired)")
-        clear_order_state()
+            clear_order_state()
         return False
 
     # Order confirmed still pending — safe to increment counter
     state["runs_since_placed"] = state.get("runs_since_placed", 0) + 1
 
     # ── Session-based expiry — cancel at NY close (21:00 UTC) ────────────────
-    now_utc    = datetime.now(timezone.utc)
-    placed_at  = datetime.fromisoformat(state["placed_at"])
-    # Ensure placed_at is timezone-aware
-    if placed_at.tzinfo is None:
-        placed_at = placed_at.replace(tzinfo=timezone.utc)
-    placed_date      = placed_at.date()
-    today            = now_utc.date()
-    past_ny_close    = now_utc.hour >= NY_SESSION_END_UTC
+    now_utc = datetime.now(timezone.utc)
+    try:
+        placed_at = datetime.fromisoformat(state["placed_at"])
+        if placed_at.tzinfo is None:
+            placed_at = placed_at.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError, KeyError):
+        log.warning("placed_at timestamp missing/corrupt — treating as placed today")
+        placed_at = now_utc
+    placed_date       = placed_at.date()
+    today             = now_utc.date()
+    past_ny_close     = now_utc.hour >= NY_SESSION_END_UTC
     days_since_placed = (today - placed_date).days
     # Keep order alive for current session + one more session (2-day hard max)
     # Day 0 (placed today)   → expires at 21:00 UTC today
@@ -778,7 +960,33 @@ def place_limit_order(symbol: str, level: float,
         log.warning("FINAL GATE BLOCKED: pending order exists — aborting")
         return -1
 
-    # Get symbol info for tick size
+    # ── PRICE VALIDATION: ensure current price is ABOVE the limit level ──────
+    # A BUY LIMIT below current price executes immediately as a market order.
+    # We never want that — if price is already below the level, the bounce
+    # thesis is invalidated and we should not enter.
+    try:
+        tick_info = mt5.symbol_info_tick(symbol)
+        if tick_info is not None:
+            current_bid = tick_info.bid
+            if current_bid <= level:
+                log.warning(
+                    f"PRICE GUARD: current bid {current_bid:.2f} is AT or BELOW "
+                    f"limit level {level:.2f} — order would fill immediately as "
+                    f"market order. Aborting."
+                )
+                return -1
+    except Exception as e:
+        log.warning(f"Price validation error: {e} — proceeding with caution")
+
+    # ── SL / TP SANITY CHECK ──────────────────────────────────────────────────
+    if sl <= 0 or sl >= level:
+        log.error(f"SL SANITY FAIL: sl={sl:.2f} level={level:.2f} — aborting")
+        return -1
+    if tp <= level:
+        log.error(f"TP SANITY FAIL: tp={tp:.2f} level={level:.2f} — aborting")
+        return -1
+
+
     info = mt5.symbol_info(symbol)
     if info is None:
         log.error(f"Symbol info not found for {symbol}")
@@ -838,8 +1046,8 @@ def send_telegram(message: str) -> bool:
         print(message)
         print("=" * 50)
         return True
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         resp = requests.post(url, json={
             "chat_id":    TELEGRAM_CHAT_ID,
             "text":       message,
@@ -848,9 +1056,22 @@ def send_telegram(message: str) -> bool:
         if resp.status_code == 200:
             log.info("Telegram alert sent ✅")
             return True
-        else:
-            log.error(f"Telegram error: {resp.status_code} {resp.text}")
+        # Telegram returns 400 if HTML is malformed (e.g. unescaped < > & in
+        # dynamic values like symbol names or error strings).  Retry without
+        # parse_mode so the message always gets through even if formatting breaks.
+        if resp.status_code == 400:
+            log.warning(f"Telegram HTML parse error ({resp.text}) — retrying as plain text")
+            resp2 = requests.post(url, json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text":    message,
+            }, timeout=10)
+            if resp2.status_code == 200:
+                log.info("Telegram alert sent (plain text fallback) ✅")
+                return True
+            log.error(f"Telegram plain-text retry failed: {resp2.status_code} {resp2.text}")
             return False
+        log.error(f"Telegram error: {resp.status_code} {resp.text}")
+        return False
     except Exception as e:
         log.error(f"Telegram send failed: {e}")
         return False
@@ -1011,14 +1232,29 @@ def main():
         symbol = get_front_month_symbol(SYMBOL_PREFIX)
         log.info(f"Symbol: {symbol}")
 
+        # ── PRE-GATE: Detect if a previously filled order just closed ─────────
+        # Must run before Gate 1 because after a stop-out there is no open
+        # position, so Gate 1 would pass and we'd skip straight to scanning.
+        # We need a quick ATR estimate here — use a lightweight bars pull.
+        try:
+            _pre_bars = get_bars(symbol, TIMEFRAME_MAP[TF_LABEL], n=20)
+            _pre_atr  = calc_atr(_pre_bars).iloc[-1]
+        except Exception:
+            _pre_atr  = 100.0   # safe fallback — zone check still works
+        check_and_update_order_outcome(symbol, _pre_atr)
+
         # ── GATE 1: Check for open positions BEFORE doing anything else ───────
-        # Outermost guard — skip entire scan if any position is open.
-        # Runs regardless of AUTO_TRADE so alerts are never sent into a live position.
+        # Outermost guard — skip entire scan if any position is open.\n        # Runs regardless of AUTO_TRADE so alerts are never sent into a live position.
         if any_position_open():
             log.info("GATE 1: position open in terminal — skipping scan entirely")
             mt5.shutdown()
             log.info("=== SCAN END — position open, no scan ===\n")
             return
+
+        # ── GATE 1b: Daily loss limit ─────────────────────────────────────────
+        if AUTO_TRADE and daily_loss_limit_reached():
+            log.info("GATE 1b: daily loss limit reached — alerts only, no orders today")
+            # Don't return — still send Telegram alerts, just block order placement
 
         # ── GATE 2: Check + cleanup pending order state (always runs) ─────────
         # Even when AUTO_TRADE=False we clean up stale order_state.json
@@ -1160,9 +1396,19 @@ def main():
             best = max(strong_levels, key=lambda x: x["score"])
 
             if best["score"] >= AUTO_TRADE_MIN_SCORE:
-                # GATE 3: Final position check immediately before order
-                if any_position_open():
-                    log.warning("AUTO_TRADE GATE 3: position opened between "
+
+                # GATE 3a: Daily loss limit
+                if daily_loss_limit_reached():
+                    log.info("AUTO_TRADE GATE 3a: daily loss limit — no order placed today")
+
+                # GATE 3b: Level cooldown — was this level already traded today?
+                elif level_traded_today(best["price"], atr_val):
+                    log.info(f"AUTO_TRADE GATE 3b: level {best['price']:.2f} "
+                             f"already traded today — skipping re-entry")
+
+                # GATE 3c: Final position check immediately before order
+                elif any_position_open():
+                    log.warning("AUTO_TRADE GATE 3c: position opened between "
                                 "scan and order — aborting")
                     send_telegram(
                         f"⚠️ Auto-trade aborted\n"
@@ -1215,7 +1461,7 @@ def main():
 
     except Exception as e:
         log.error(f"Scan error: {e}")
-        log.debug(traceback.format_exc())
+        log.error(traceback.format_exc())
         send_telegram(f"⚠️ levels_alert ERROR\n{str(e)[:200]}")
 
     finally:
