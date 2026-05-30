@@ -19,11 +19,6 @@ import pandas as pd
 import joblib
 from datetime import datetime, timezone
 from pathlib import Path
-# ── Windows console UTF-8 fix (emoji in log output) ──────────────────────────
-import sys
-if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG — edit these
@@ -77,8 +72,10 @@ AUTO_TRADE           = True
 AUTO_TRADE_MIN_SCORE = 0.75
 AUTO_TRADE_VOLUME    = 1.0
 AUTO_TRADE_MAGIC     = 20260002          # unique magic number — do not share with other EAs
-ORDER_EXPIRY_RUNS    = 12                # Task Scheduler runs before pending order cancelled
-                                         # 12 runs x 5 min = 60 min = 1 H1 bar
+NY_SESSION_END_UTC   = 21               # Hour (UTC) unfilled orders are cancelled
+                                         # 21:00 UTC = 5:00 PM ET = end of NY session
+ORDER_EXPIRY_RUNS    = 252              # Hard backstop — 252 runs x 5 min = 21 hours
+                                         # catches edge case of order placed just before session end
 ORDER_STATE_PATH     = "logs/order_state.json"
 
 # ── LEVEL DETECTION PARAMS ────────────────────────────────────────────────────
@@ -86,8 +83,8 @@ SWING_LOOKBACK = 5       # bars each side to confirm a swing low
 LEVEL_ZONE_ATR = 0.30    # level zone half-width as ATR multiple
 
 # ── ORDER SIZING ──────────────────────────────────────────────────────────────
-SL_ATR = 1.5             # stop loss distance as ATR multiple
-TP_R   = 3.0             # take profit as R multiple
+SL_ATR = 1.5             # stop loss distance as ATR multiple  [updated per OOS study]
+TP_R   = 3.0             # take profit as R multiple              [updated per OOS study]
 
 # ── HTF PROXIMITY THRESHOLDS (must match levels_ml_win.py) ───────────────────
 HTF_CONFLUENCE_THRESH     = 0.75   # ATR multiples for support stack count
@@ -324,11 +321,11 @@ def get_daily_trend(symbol):
             "bullish":   bullish,
             "close":     last_c,
             "ema100":    last_e,
-            "label":     "BULLISH [OK]" if bullish else "BEARISH [--]",
+            "label":     "BULLISH ✅" if bullish else "BEARISH ❌",
         }
     except Exception as e:
         log.warning(f"Daily trend error: {e}")
-        return {"bullish": None, "close": 0, "ema100": 0, "label": "UNKNOWN [??]"}
+        return {"bullish": None, "close": 0, "ema100": 0, "label": "UNKNOWN ⚠️"}
 
 
 def get_active_levels(bars, current_price, atr_val):
@@ -689,7 +686,7 @@ def check_and_cleanup_pending(symbol: str) -> bool:
         positions = mt5.positions_get(symbol=symbol)
         filled = [p for p in (positions or []) if p.magic == AUTO_TRADE_MAGIC]
         if filled:
-            log.info(f"[FILLED] Order #{ticket} filled → position open")
+            log.info(f"✅ Order #{ticket} filled → position open")
         else:
             log.info(f"Order #{ticket} no longer pending (cancelled/expired)")
         clear_order_state()
@@ -698,9 +695,21 @@ def check_and_cleanup_pending(symbol: str) -> bool:
     # Order confirmed still pending — safe to increment counter
     state["runs_since_placed"] = state.get("runs_since_placed", 0) + 1
 
-    # Order still pending — check expiry (ORDER_EXPIRY_RUNS = ~1 H1 bar at 5-min schedule)
-    if state["runs_since_placed"] >= ORDER_EXPIRY_RUNS:
-        log.info(f"[EXPIRED] Order #{ticket} expired after {ORDER_EXPIRY_RUNS} runs — cancelling")
+    # ── Session-based expiry — cancel at NY close (21:00 UTC) ────────────────
+    now_utc    = datetime.now(timezone.utc)
+    placed_at  = datetime.fromisoformat(state["placed_at"])
+    # Ensure placed_at is timezone-aware
+    if placed_at.tzinfo is None:
+        placed_at = placed_at.replace(tzinfo=timezone.utc)
+    placed_date      = placed_at.date()
+    today            = now_utc.date()
+    past_ny_close    = now_utc.hour >= NY_SESSION_END_UTC
+    session_expired  = (placed_date == today and past_ny_close) or                        (placed_date < today)   # order from a previous day — always cancel
+    run_backstop     = state["runs_since_placed"] >= ORDER_EXPIRY_RUNS
+
+    if session_expired or run_backstop:
+        reason = "NY session closed (21:00 UTC)" if session_expired else                  f"run backstop ({ORDER_EXPIRY_RUNS} runs)"
+        log.info(f"[EXPIRED] Order #{ticket} cancelled — {reason}")
         req = {"action": mt5.TRADE_ACTION_REMOVE, "order": ticket}
         try:
             result = mt5.order_send(req)
@@ -711,15 +720,18 @@ def check_and_cleanup_pending(symbol: str) -> bool:
             log.warning(f"Cancel order_send returned None for #{ticket}: {mt5.last_error()}")
         elif result.retcode == mt5.TRADE_RETCODE_DONE:
             log.info(f"Order #{ticket} cancelled successfully")
-            send_telegram(f"[EXPIRED] Limit order #{ticket} expired unfilled — cancelled")
+            send_telegram(f"[EXPIRED] Limit order #{ticket} cancelled — {reason}")
         else:
             log.warning(f"Cancel failed for #{ticket}: retcode={result.retcode}")
         clear_order_state()
         return False
 
     save_order_state(state)
-    log.info(f"Pending order #{ticket} still active "
-             f"({state['runs_since_placed']}/{ORDER_EXPIRY_RUNS} runs)")
+    now_utc = datetime.now(timezone.utc)
+    hrs_to_close = max(0, NY_SESSION_END_UTC - now_utc.hour)
+    log.info(f"Pending order #{ticket} still active | "
+             f"run {state['runs_since_placed']} | "
+             f"NY close in ~{hrs_to_close}h ({NY_SESSION_END_UTC}:00 UTC)")
     return True
 
 
@@ -1048,7 +1060,7 @@ def main():
 
                 # Check duplicate suppression
                 if is_duplicate(lv["price"], score, last_alert, atr_val):
-                    log.info(f"  -> suppressed (alerted recently)")
+                    log.info(f"  → suppressed (alerted recently)")
                     continue
 
                 if score >= SCORE_STRONG:
@@ -1162,7 +1174,7 @@ def main():
                             f"   Entry : {best['price']:,.2f}\n"
                             f"   SL    : {sl:,.2f}  ({risk:.0f}pts / ${risk*2:.0f})\n"
                             f"   TP    : {tp:,.2f}  ({risk*TP_R:.0f}pts / ${risk*TP_R*2:.0f})\n"
-                            f"   Status: Waiting for fill (expires in ~{ORDER_EXPIRY_RUNS} runs / 1 H1 bar)"
+                            f"   Status: Waiting for fill (expires at NY close 21:00 UTC)"
                         )
                         send_telegram(order_msg)
                         log.info(f"AUTO_TRADE: order placed #{ticket} @ {best['price']:.2f}")
