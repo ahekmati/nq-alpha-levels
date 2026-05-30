@@ -125,15 +125,21 @@ import MetaTrader5 as mt5
 
 Path("logs").mkdir(exist_ok=True)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+# ── Logging — UTF-8 on both handlers so emojis don't crash on Windows ────────
+_log_fmt = logging.Formatter(
+    fmt="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(SCAN_LOG_PATH),
-    ]
 )
+_stream_handler = logging.StreamHandler()
+_stream_handler.setFormatter(_log_fmt)
+# Wrap stdout in utf-8 to handle emoji characters on Windows cp1252 consoles
+import io as _io
+_stream_handler.stream = _io.TextIOWrapper(
+    _stream_handler.stream.buffer, encoding="utf-8", errors="replace", line_buffering=True
+)
+_file_handler = logging.FileHandler(SCAN_LOG_PATH, encoding="utf-8")
+_file_handler.setFormatter(_log_fmt)
+logging.basicConfig(level=logging.INFO, handlers=[_stream_handler, _file_handler])
 log = logging.getLogger("levels_alert")
 
 
